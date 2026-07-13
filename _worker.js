@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "1.0.0";
+const CURRENT_VERSION = "1.1.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -575,6 +575,7 @@ async function serveMaintenancePage(request, url) {
 }
 
 function serveSubscriptionInfoPage(user, host, url, request) {
+    const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     let idClean = user.id.replace(/-/g, '').toLowerCase();
     let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
     let totalReqs = sysU.reqs || 0;
@@ -640,7 +641,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${user.name} - Subscriber Portal</title>
+    <title>${esc(user.name)} - Subscriber Portal</title>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         * { border-radius: 0; box-shadow: none !important; }
@@ -746,7 +747,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
                     <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
                 </div>
                 <div>
-                    <h1 class="text-xl md:text-2xl font-black tracking-tight" style="color: var(--text);">${user.name}</h1>
+                    <h1 class="text-xl md:text-2xl font-black tracking-tight" style="color: var(--text);">${esc(user.name)}</h1>
                     <p class="text-xs mt-1 font-mono" style="color: var(--text-3);">${user.id}</p>
                 </div>
             </div>
@@ -854,7 +855,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
                 limit: { en: 'Limit Exceeded', bg: 'var(--red-bg)', border: 'var(--red-border)', color: 'var(--red-text)' },
                 dailyLimit: { en: 'Daily Limit Exceeded', bg: 'var(--red-bg)', border: 'var(--red-border)', color: 'var(--red-text)' }
             };
-            const s = map['${statusCode}'] || map.active;
+            const s = map[${JSON.stringify(statusCode)}] || map.active;
             badge.textContent = s.en;
             badge.style.background = s.bg;
             badge.style.borderColor = s.border;
@@ -5028,9 +5029,19 @@ function getDashboardUI(hasDB) {
               .mobile-bottom-nav {
                   background: var(--surface) !important;
                   border-top: 1px solid var(--border) !important;
+                  position: fixed !important;
+                  bottom: 0 !important;
+                  left: 0 !important;
+                  right: 0 !important;
               }
               .mobile-tab-item.active { color: var(--accent); }
               ::-webkit-scrollbar { width: 0; height: 0; }
+              #sidebar { display: none !important; }
+              #main-content { margin-left: 0 !important; min-height: 0 !important; flex: 1 !important; overflow-y: auto !important; padding-bottom: calc(4rem + env(safe-area-inset-bottom, 0px)) !important; }
+              #ov-stats-grid { grid-template-columns: repeat(2, 1fr) !important; }
+              #ov-bento-grid { grid-template-columns: 1fr !important; }
+              #net-stats-grid { grid-template-columns: repeat(2, 1fr) !important; }
+              #save-bar { bottom: calc(4rem + env(safe-area-inset-bottom, 0px) + 12px) !important; }
           }
       </style>
   </head>
@@ -5103,14 +5114,14 @@ function getDashboardUI(hasDB) {
           .user-status.paused { color: #fbbf24; border: 1px solid rgba(251,191,36,0.2); }
           .user-status.disabled { color: #ef4444; border: 1px solid rgba(239,68,68,0.2); }
           .user-traffic { margin-bottom: 8px; }
-          .user-traffic-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #444; margin-bottom: 4px; display: flex; justify-content: space-between; }
+          .user-traffic-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #777; margin-bottom: 4px; display: flex; justify-content: space-between; }
           .user-bar { height: 3px; background: #222; width: 100%; }
           .user-bar-fill { height: 100%; transition: width 0.3s; }
           .user-bar-fill.green { background: #22c55e; }
           .user-bar-fill.amber { background: #fbbf24; }
           .user-bar-fill.red { background: #ef4444; }
           .user-actions { display: flex; gap: 4px; flex-wrap: wrap; }
-          .user-action { padding: 4px 8px; font-family: 'JetBrains Mono', monospace; font-size: 10px; border: 1px solid #222; background: transparent; color: #444; cursor: pointer; transition: all 0.1s; }
+          .user-action { padding: 4px 8px; font-family: 'JetBrains Mono', monospace; font-size: 10px; border: 1px solid #222; background: transparent; color: #777; cursor: pointer; transition: all 0.1s; }
           .user-action:hover { border-color: #777; color: #777; }
           .user-action.danger:hover { border-color: #ef4444; color: #ef4444; }
 
@@ -5168,22 +5179,22 @@ function getDashboardUI(hasDB) {
           .log-badge.blue { color: #3b82f6; border: 1px solid rgba(59,130,246,0.2); }
           .log-badge.purple { color: #a78bfa; border: 1px solid rgba(167,139,250,0.2); }
           .log-text { flex: 1; color: #777; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 300px; }
-          .log-time { color: #444; white-space: nowrap; }
+          .log-time { color: #777; white-space: nowrap; }
 
           /* Profile Card Styles */
           .profile-card { border: 1px solid #222; margin-bottom: 8px; background: #141414; }
           .profile-header { padding: 14px 16px; border-bottom: 1px solid #222; display: flex; justify-content: space-between; align-items: center; }
           .profile-name { font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600; }
-          .profile-id { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #444; }
+          .profile-id { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #777; }
           .profile-actions { display: flex; gap: 6px; }
           .profile-action { padding: 4px 8px; font-family: 'JetBrains Mono', monospace; font-size: 10px; border: 1px solid #222; background: transparent; color: #777; cursor: pointer; transition: all 0.1s; }
           .profile-action:hover { border-color: #22c55e; color: #22c55e; }
-          .profile-url { padding: 10px 16px; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #444; word-break: break-all; border-top: 1px solid #222; display: flex; align-items: center; gap: 8px; }
+          .profile-url { padding: 10px 16px; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #777; word-break: break-all; border-top: 1px solid #222; display: flex; align-items: center; gap: 8px; }
 
           /* Stats Grid */
           .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: #222; border: 1px solid #222; margin-bottom: 24px; }
           .stat-card { background: #141414; padding: 16px; }
-          .stat-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #444; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+          .stat-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #777; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
           .stat-value { font-family: 'JetBrains Mono', monospace; font-size: 24px; font-weight: 700; color: #e5e5e5; }
           .stat-value.green { color: #22c55e; }
           .stat-value.amber { color: #fbbf24; }
@@ -5213,7 +5224,7 @@ function getDashboardUI(hasDB) {
           .field { margin-bottom: 14px; }
           .field-label { display: block; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 500; color: #777; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
           .field-input, .field-select, .field-textarea { width: 100%; padding: 10px 12px; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #e5e5e5; background: #0c0c0c; border: 1px solid #222; outline: none; transition: border-color 0.15s; }
-          .field-input::placeholder, .field-textarea::placeholder { color: #444; }
+          .field-input::placeholder, .field-textarea::placeholder { color: #777; }
           .field-input:focus, .field-select:focus, .field-textarea:focus { border-color: #22c55e; }
           .field-textarea { resize: vertical; min-height: 60px; }
 
@@ -5238,10 +5249,10 @@ function getDashboardUI(hasDB) {
           .toggle.on .toggle-knob { left: 18px; background: #000; }
 
           /* Section Label */
-          .section-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #444; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; }
+          .section-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #777; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; }
       </style>
               <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#444;margin-bottom:24px;letter-spacing:0.05em;text-transform:uppercase">
-                   <span style="color:#22c55e">~</span> / swin shady / auth
+                   <span style="color:#22c55e">~</span> / 🦈 swim shady / auth
               </div>
               <div style="background:#141414;border:1px solid #222">
                   <div style="display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid #222;font-family:'JetBrains Mono',monospace;font-size:12px;color:#777">
@@ -5284,9 +5295,9 @@ function getDashboardUI(hasDB) {
       <div id="dash-box" class="hidden w-full h-full flex-col md:flex-row relative dash-box-native" style="padding-top: env(safe-area-inset-top, 0px);">
           
           <!-- SIDEBAR (Desktop) -->
-          <aside style="width:220px;height:100vh;position:fixed;left:0;top:0;background:#141414;border-right:1px solid #222;display:flex;flex-direction:column;z-index:10">
+          <aside id="sidebar" style="width:220px;height:100vh;position:fixed;left:0;top:0;background:#141414;border-right:1px solid #222;display:flex;flex-direction:column;z-index:10">
               <div style="padding:20px 16px;border-bottom:1px solid #222">
-                  <div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:#22c55e" data-i18n="title">swin shady</div>
+                  <div style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:#22c55e" data-i18n="title">🦈 swim shady</div>
                   <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;margin-top:3px;text-transform:uppercase;letter-spacing:0.08em">gateway console</div>
               </div>
               <nav class="flex-1 overflow-y-auto" style="padding:12px 8px">
@@ -5332,7 +5343,7 @@ function getDashboardUI(hasDB) {
           </aside>
   
           <!-- MAIN CONTENT AREA -->
-          <main style="margin-left:220px;flex:1;min-height:100vh;display:flex;flex-direction:column">
+          <main id="main-content" style="margin-left:220px;flex:1;min-height:100vh;display:flex;flex-direction:column">
               <header style="display:flex;align-items:center;justify-content:space-between;padding:16px 32px;border-bottom:1px solid #222;background:#141414;position:sticky;top:0;z-index:5">
                   <div id="view-title" style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:600;color:#e5e5e5">~/ overview</div>
                   <div style="display:flex;align-items:center;gap:16px">
@@ -5341,7 +5352,7 @@ function getDashboardUI(hasDB) {
                       <a href="https://github.com/Ceetherr/swimshady" target="_blank" style="color:#777;transition:color 0.15s" onmouseover="this.style.color='#e5e5e5'" onmouseout="this.style.color='#777'">
                           <svg style="width:16px;height:16px" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path></svg>
                       </a>
-                      <button style="font-family:'JetBrains Mono',monospace;font-size:11px;padding:5px 10px;background:transparent;border:1px solid #222;color:#777;cursor:pointer" disabled>en</button>
+
                   </div>
               </header>
               <div style="flex:1;padding:24px;overflow-y:auto">
@@ -5350,19 +5361,33 @@ function getDashboardUI(hasDB) {
               <div class="scroll-content flex-1 overflow-y-auto" style="padding:24px">
                   <div class="space-y-6 fade-in">
 
-                      <!-- Update Banner (removed for now) -->
+                      <!-- Update Banner -->
+                      <div id="update-alert-banner" class="hidden items-center justify-between p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/5" style="display:none">
+                          <div class="flex-1 min-w-0">
+                              <p id="update-alert-text" class="text-sm font-bold text-emerald-600 dark:text-emerald-400"></p>
+                              <a id="update-github-link" href="#" target="_blank" class="text-[10px] text-slate-400 hover:text-slate-200 transition-colors mt-1 inline-block"></a>
+                              <div id="update-changelog-area" class="hidden mt-3">
+                                  <div id="update-changelog-content" class="text-xs text-slate-400 max-h-48 overflow-y-auto rounded-lg bg-slate-900/50 p-3 border border-slate-800"></div>
+                              </div>
+                          </div>
+                          <div class="flex items-center gap-2 shrink-0 ms-4">
+                              <button onclick="doUpdate()" id="update-deploy-btn" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-lg transition-colors">Deploy</button>
+                              <button onclick="dismissUpdate()" class="px-3 py-2 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 text-xs font-bold rounded-lg transition-colors">Dismiss</button>
+                          </div>
+                          <div id="update-deploy-status" class="hidden w-full mt-3 p-3 rounded-xl text-sm font-bold text-center"></div>
+                      </div>
 
                       <!-- OVERVIEW / DASHBOARD VIEW -->
                        <div id="view-overview" class="block">
                           <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:12px">// users</div>
-                          <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:#222;border:1px solid #222;margin-bottom:24px">
+                          <div id="ov-stats-grid" style="display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:#222;border:1px solid #222;margin-bottom:24px">
                               <div style="background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="ov_total_users">Total Users</div><p id="ov-total-users" style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#e5e5e5">-</p></div>
                               <div style="background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="ov_active_users">Active</div><p id="ov-active-users" style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#22c55e">-</p></div>
                               <div style="background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="ov_paused_users">Paused</div><p id="ov-paused-users" style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#fbbf24">-</p></div>
                               <div style="background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="ov_auto_disabled">Disabled</div><p id="ov-auto-disabled" style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#ef4444">-</p></div>
                               <div style="background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="ov_expired_users">Expired</div><p id="ov-expired-users" style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:700;color:#e5e5e5">-</p></div>
                           </div>
-                          <div style="display:grid;grid-template-columns:2fr 1fr;gap:1px;background:#222;border:1px solid #222;margin-bottom:24px">
+                          <div id="ov-bento-grid" style="display:grid;grid-template-columns:2fr 1fr;gap:1px;background:#222;border:1px solid #222;margin-bottom:24px">
                               <div style="background:#141414;padding:20px">
                                   <div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:#777;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:16px" data-i18n="ov_total_traffic">// traffic</div>
                                   <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #222"><span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#777" data-i18n="ov_total_traffic">total traffic</span><span style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;color:#e5e5e5" id="ov-total-traffic">- GB</span></div>
@@ -5400,14 +5425,14 @@ function getDashboardUI(hasDB) {
                        <!-- NETWORK/METRICS VIEW -->
                        <div id="view-network" class="hidden">
                            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:12px">// network diagnostics</div>
-                           <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:#222;border:1px solid #222;margin-bottom:24px">
+                           <div id="net-stats-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:#222;border:1px solid #222;margin-bottom:24px">
                                <div style="background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="stat_ip">origin ip</div><p id="net-ip" style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:#3b82f6">...</p></div>
                                <div style="background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="stat_dc">edge node</div><p id="net-colo" style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:#22c55e">...</p></div>
                                <div style="background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="stat_loc">region</div><p id="net-loc" style="font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;color:#a78bfa">...</p></div>
                            </div>
                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
                                <div style="border:1px solid #222;background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px" data-i18n="stat_datetime">date / time</div><div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:#e5e5e5" id="net-datetime">...</div></div>
-                               <div style="border:1px solid #222;background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">active conns</div><div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:#22c55e" id="ov-active-conns">-</div></div>
+                               <div style="border:1px solid #222;background:#141414;padding:16px"><div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:#444;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px">active conns</div><div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:#22c55e" id="net-active-conns">-</div></div>
                            </div>
                            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:12px">// live profile usage</div>
                            <div style="border:1px solid #222;background:#141414;margin-bottom:16px">
@@ -6432,7 +6457,7 @@ function getDashboardUI(hasDB) {
           const CURRENT_VERSION = "${CURRENT_VERSION}";
           const i18n = {
               en: {
-                  title: "swin shady", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.",
+                  title: "🦈 swim shady", pass_ph: "Master Key", login_btn: "Authenticate", err_pass: "Access Denied", missing_db: "⚠️ IOT_DB namespace missing! Settings won't save.",
                    logout: "Disconnect", tab_overview: "overview", tab_info: "endpoints", tab_status: "metrics", tab_settings: "system", tab_adv: "advanced", tab_logs: "activity logs",
                   qr_title: "Direct Stream Link", badge_multi: "Dual-Core Multiplexed", copy: "Copy", copied: "Copied to clipboard!", sync_link: "Cloud Sync URL", active_id: "Hardware ID",
                   stat_ip: "Origin IP", stat_dc: "Edge Node", stat_loc: "Data Region",
@@ -6523,364 +6548,30 @@ function getDashboardUI(hasDB) {
                     lbl_user_panel_url: "Main Panel URL (Custom Nodes)", desc_user_panel_url: "Main panel domain for custom nodes. If empty, default panel URL is used.",
                     html_desc_strategy: "Supported placeholders: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{COUNTRY}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{CITY}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{ISP}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{HOST}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{DATE}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{INDEX}</code>, <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{WORKER}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: Country flag emoji (e.g. 🇺🇸).<br>• <b>{COUNTRY}</b>: Country name (e.g. United States).<br>• <b>{CITY}</b>: City name (e.g. San Francisco).<br>• <b>{ISP}</b>: ISP / ASN org (e.g. Cloudflare, Inc.).<br>• <b>{PROTOCOL}</b>: Core mode (VLESS / Trojan).<br>• <b>{USER}</b>: Subscriber name.<br>• <b>{PORT}</b>: Active port.<br>• <b>{PREFIX}</b>: Custom prefix.<br>• <b>{IP}</b>: Clean IP address.<br>• <b>{HOST}</b>: Hostname.<br>• <b>{DATE}</b>: Current date (YYYY-MM-DD).<br>• <b>{INDEX}</b>: Config index (0, 1, 2...).<br>• <b>{WORKER}</b>: Worker name from config.</span><br>Pre-defined strategies: <code>default</code>, <code>type-user-port</code>, <code>user-port</code>, <code>host-port-user</code>, <code>prefix-user-port</code>, <code>ip</code>.",
                },
-              fa: {
-                  title: "دروازه SwimShady", pass_ph: "کلید اصلی", login_btn: "ورود به سیستم", err_pass: "دسترسی مسدود شد", missing_db: "⚠️ فضای پایگاه داده یافت نشد! تنظیمات ذخیره نمی‌شوند.",
-                  logout: "خروج", tab_overview: "نمای کلی", tab_info: "نقاط اتصال", tab_status: "وضعیت شبکه", tab_settings: "تنظیمات پایه", tab_adv: "پیشرفته", tab_logs: "گزارش فعالیت",
-                  qr_title: "لینک اتصال مستقیم", badge_multi: "ترکیب ترانزیت پیشرفته دوگانه", copy: "کپی", copied: "در حافظه کپی شد!", sync_link: "لینک ساب (همگام سازی ابری)", active_id: "شناسه سخت‌افزار",
-                  stat_ip: "آی‌پی مبدا", stat_dc: "گره لبه", stat_loc: "منطقه داده",
-                  lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
-                  lbl_path: "مسیر مخفی آی‌پی‌آی", lbl_pass: "کلید اصلی", lbl_fp: "امضای امنیتی", lbl_dns: "آی‌پی تحلیلگر",
-                  lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
-                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن",
-                  lbl_fake_configs: "ورودی‌های اطلاعاتی اشتراک", desc_fake_configs: "متن نمایشی ورودی‌ها در پروفایل اشتراک را سفارشی کنید. از {usage} و {expiry} برای مقادیر پویا استفاده کنید.", btn_add_entry: "افزودن ورودی", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
-                  lbl_cf_acc: "شناسه اکانت ابری", lbl_cf_token: "توکن دسترسی کاربری", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از صد هزار درخواست رایگان در پیام‌های تلگرام.",
-                  lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
-                   lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
-                   lbl_api_keys: "کلیدهای API پنل", desc_api_keys: "کلیدهای API برای اتصال امن پنل‌های راهدور ایجاد کنید. پنل‌های راهدور به جای اشتراک‌گذاری کلید اصلی، از این کلیدها استفاده می‌کنند.",
-                   btn_generate_key: "ایجاد کلید", api_key_created: "کلید API ایجاد شد! آن را کپی کنید — دوباره نمایش داده نخواهد شد.",
-                   api_keys_empty: "هنوز کلید API ایجاد نشده.", enter_key_name: "نامی برای این کلید API وارد کنید:",
-                   confirm_revoke: "این کلید API لغو شود؟ پنل راهدور دسترسی خود را از دست خواهد داد.", revoke: "لغو",
-                   created: "ایجاد شده", last_used: "آخرین استفاده", never: "هرگز",
-                   tab_users: "کاربران",
-                  user_mgt_title: "مدیریت کاربران", user_mgt_desc: "مدیریت کاربران متعدد، تنظیم محدودیت ترافیک، و تاریخ انقضا.", btn_add_user: "+ افزودن کاربر جدید",
-                  tbl_name: "نام", tbl_uuid: "شناسه یکتا", tbl_traffic: "ترافیک (مصرفی/محدودیت)", tbl_exp: "انقضا", tbl_action: "عملیات", no_users: "کاربری یافت نشد. از دکمه بالا یک کاربر ایجاد کنید.",
-                  modal_add_title: "افزودن کاربر جدید", lbl_u_name: "نام (الزامی)", lbl_u_gb: "محدودیت ترافیک (گیگابایت) - اختیاری", lbl_u_days: "مدت زمان اعتبار (روز) - اختیاری", btn_cancel: "انصراف", btn_confirm: "افزودن کاربر",
-                  save_btn: "ذخیره تنظیمات", msg_saving: "در حال ثبت...", msg_saved: "موفق! در حال بارگذاری...", msg_err: "خطای ارتباط",
-                  backup_restore_title: "پشتیبان‌گیری و بازیابی", ping_test_title: "عیب‌یابی تاخیر شبکه", ping_test_desc: "تاخیر پاسخ‌دهی را به آی‌پی تمیز فعال اندازه بگیرید.",
-                  lbl_github_repo: "مخزن منبع جهت بروزرسانی", update_avail: "بروزرسانی جدید در دسترس است!", update_btn: "دریافت آخرین کد",
-                    cf_help_title: "آموزش بدست آوردن این اطلاعات برای کاربران مبتدی",
-                    lbl_update_format: "قالب بروزرسانی و حذف ردگیری:",
-                    desc_update_format: "سورس کد معمولی را دپلوی کنید یا از مبهم‌سازی بایت‌ها با کلید متغیر XOR برای عدم فیلترینگ استفاده نمایید.",
-                    format_normal: "معمولی (_worker.js)",
-                    format_obfuscated: "مبهم‌سازی شده (UTF-8 + XOR)",
-                    btn_redeploy_force: "تفویض مجدد / تغییر قالب پنل",
-                    adv_network_dns: "شبکه و DNS", adv_proxy_relay: "پروکسی و رله", adv_subscription: "اشتراک",
-                    adv_protocol: "پروتکل", adv_telegram: "ربات تلگرام", adv_cloudflare: "کلودفلر",
-                    stat_datetime: "تاریخ و زمان",
-                    desc_custom_panel_url: "اختیاری. یک دامنه/آدرس سفارشی برای لینک‌های ساب/همگام‌سازی وارد کنید. اگر خالی باشد، آدرس پیش‌فرض ورکر استفاده می‌شود.",
-                    lbl_custom_config_name: "نام/پیشوند سفارشی کانفیگ",
-                    lbl_traffic_limit_gb: "محدودیت ترافیک (GB)",
-                    lbl_daily_limit_gb: "محدودیت روزانه (GB)",
-                    lbl_expiration_days: "تاریخ انقضا (روز)",
-                    loading_logs: "در حال بارگذاری گزارش‌ها...", show_qr: "نمایش کد QR",
-                    no_matching_users: "کاربری مطابقت نداشت", no_active_conn: "هنوز داده اتصال فعالی ثبت نشده.",
-                    qr_subtitle: "با کلاینت V-Core یا T-Core اسکن کنید",
-                    no_activity_logs: "گزارش فعالیتی یافت نشد.", no_recent_activity: "فعالیت اخیری ثبت نشده.",
-                    no_ips_advanced: "آی‌پی‌ای در بخش پیشرفته اضافه نشده", no_nodes_advanced: "نود فرعی‌ای در بخش پیشرفته اضافه نشده",
-                    no_changelog: "گزارش تغییراتی برای این نسخه موجود نیست.", no_changes: "تغییراتی ثبت نشده.",
-                    section_basic_info: "اطلاعات پایه", section_limits: "محدودیت‌ها", section_network: "شبکه", section_advanced: "پیشرفته",
-                    lbl_nat64: "پیشوند NAT64", desc_nat64: "اختیاری. آی‌پی‌های پروکسی IPv4 را به آدرس‌های NAT64 IPv6 تبدیل می‌کند. چند پیشوند پشتیبانی می‌شود.",
-                    lbl_direct_configs: "شامل کانفیگ‌های مستقیم", desc_direct_configs: "تولید کانفیگ‌ها بدون آی‌پی پروکسی در کنار کانفیگ‌های رله",
-                    lbl_sync_api_key: "کلید API همگام‌سازی (ارسال به اسلیو)", desc_sync_api_key: "کلید API از پنل اسلیو. پنل اصلی با این کلید کانفیگ را ارسال می‌کند. این کلید باید در کلیدهای API پنل اسلیو وجود داشته باشد.",
-                    lbl_auto_update: "بروزرسانی خودکار", desc_auto_update: "دپلوی خودکار هنگام شناسایی نسخه جدید",
-                    lbl_auto_update_format: "قالب بروزرسانی", format_normal_label: "معمولی", format_obfuscated_label: "مبهم‌سازی شده",
-                    desc_format_normal: "استاندارد _worker.js", desc_format_obfuscated: "جابجایی بایت XOR",
-                    lbl_clean_ips: "آی‌پی‌های تمیز", lbl_proxy_ips: "آی‌پی‌های پروکسی", lbl_assigned_nodes: "نودهای اختصاصی",
-                    lbl_protocol_mode: "پروتکل", lbl_max_configs: "حداکثر کانفیگ",
-                    desc_assigned_nodes: "نودهای سفارشی (کاما/خط جدید، خالی = همه نودها)",
-                    desc_nat64_user: "اختیاری. آی‌پی‌های پروکسی IPv4 را به آدرس‌های NAT64 IPv6 تبدیل می‌کند.",
-                    desc_proxy_ips: "آی‌پی‌های پروکسی سفارشی (کاما/خط جدید)",
-                    desc_clean_ips_modal: "آی‌پی‌های تمیز سفارشی (کاما/خط جدید)",
-                    btn_generate_uuid: "تولید UUID",
-                    lbl_conn_limit: "محدودیت اتصال همزمان", desc_conn_limit: "حداکثر اتصالات همزمان برای هر کاربر. برای نامحدود خالی بگذارید.",
-                    lbl_user_panel_url: "آدرس پنل اصلی (نودهای سفارشی)", desc_user_panel_url: "دامنه پنل اصلی برای نودهای سفارشی. اگر خالی باشد، آدرس پنل پیش‌فرض استفاده می‌شود.",
-                  metrics_live: "وضعیت زنده مصرف اتصالات و پردازش", no_metrics: "هنوز داده‌ای از تراکنش و اتصالات فعال ثبت نشده است.", run_diagnostics: "⚡ اجرای عیب‌یابی شبکه",
-                  target_node: "هدف گره شبکه", response: "مدت زمان تاخیر پاسخگویی", status: "وضعیت گره", local_port: "درگاه محلی",
-                  lbl_doh: "تحلیل‌گر تخصصی آدرس‌یابی عددی", lbl_strategy: "روش نام‌گذاری کانفیگ‌ها", lbl_prefix: "پیشوند نام کانفیگ‌ها",
-                  slave_title: "سایر نودهای موازی", slave_desc: "آدرس دامنه سایر ورکرها را وارد نمایید (هر خط یک آدرس). نود اصلی تنظیمات و مشترکین را به صورت خودکار با آن‌ها هماهنگ می‌کند!",
-                  force_sync: "همگام‌سازی اجباری نودها", limit_total: "محدودیت تعداد کل درخواست‌ها (GB)  (برای نامحدود خالی بگذارید)", limit_daily: "محدودیت درخواست‌های روزانه (GB)  (برای نامحدود خالی بگذارید)",
-                  limit_days: "مدت زمان اعتبار قانونی (روز) - برای نامحدود خالی بگذارید", edit_sub: "ویرایش مشترک", lbl_name_ph: "نام یا شناسه یکتا",
-                  btn_save_changes: "ذخیره تغییرات", save_btn_user: "ثبت کاربر جدید", status_active: "فعال", status_paused: "متوقف شده", status_expired: "منقضی شده",
-                  export_btn: "📥 برون‌بری فایل پیکربندی (نسخه پشتیبان)", import_btn: "📤 درون‌ریزی فایل پیکربندی (نسخه پشتیبان)",
-                  stat_total_subscribers: "کل مشترکین", stat_active_paused: "فعال / متوقف شده", stat_cumulative_traffic: "ترافیک کل انباشته", stat_auto_disabled: "غیرفعال خودکار",
-                  sub_directory_title: "فهرست مشترکین", sub_directory_desc: "جستجو، اصلاح محدودیت‌ها، تغییر محدودیت‌های ترافیک یا پاک کردن جلسات حسابداری.", user_search_placeholder: "🔍 جستجو بر اساس نام یا شناسه...",
-                  filter_all: "همه کاربران", filter_active: "فعال", filter_paused: "متوقف شده", filter_auto_disabled: "غیرفعال خودکار",
-                  disabled_panel_title: "کاربران اخیراً غیرفعال شده", disabled_panel_desc: "کاربرانی که به دلیل اتمام سهمیه یا تاریخ انقضا غیرفعال شده‌اند",
-                  lbl_u_Protocol:"نوع پروتکل(خالی بر اساس تنظیمات کلی)",
-                  lbl_u_ports:"نوع پورت",
-                  lbl_u_max_config:"حداکثر تعداد کانفیگ",
-                  login_password:"رمز ورود",
-                  lbl_u_ipproxy:"آی‌پی(های) پروکسی کاربر (اختیاری - آی‌پی پاک سراسری را نادیده می‌گیرد، با کاما/خط جدید از هم جدا می‌شوند)",
-                  v_pop_title: "اطلاعیه تعمیرات", v_pop_whatsnew: "ویژگی‌های جدید", v_pop_headline: "امکانات جدید و بهبودها",
-                  v_pop_btn: "متوجه شدم!",
-                  changelog_title: "گزارش تغییرات و توضیحات نسخه جدید:",
-                   changelog_added: "اضافه شده", changelog_fixed: "رفع شده", changelog_improved: "بهبود یافته", changelog_changed: "تغییر یافته", changelog_note: "نکات مهم",
-                   ov_total_users: "کل کاربران", ov_active_users: "فعال", ov_paused_users: "متوقف", ov_auto_disabled: "غیرفعال خودکار", ov_expired_users: "منقضی",
-                   ov_total_traffic: "ترافیک کل", ov_today_traffic: "ترافیک امروز", ov_requests: "درخواست", ov_active_conns: "اتصالات فعال",
-                   ov_system: "سیستم", ov_recent_activity: "فعالیت‌های اخیر", ov_view_all: "مشاهده همه ←", ov_loading: "در حال بارگذاری...",
-                   ov_quick_actions: "عملیات سریع", ov_add_user: "افزودن کاربر", ov_backup_config: "پشتیبان‌گیری", ov_refresh: "بروزرسانی آمار", ov_manage_users: "مدیریت کاربران",
-                   ov_gb_unit: "گیگابایت",
-                     lbl_allow_sync:"اجازه همگام سازی",
-                     other_nodes_title: "سایر نودها", other_nodes_desc: "نودهای خارجی (URL + کلید API) برای مدیریت بین پنل‌ها.",
-                     add_node_title: "افزودن نود خارجی", add_node_desc: "آدرس URL و کلید API پنل خارجی را وارد کنید.",
-                     add_node_url: "آدرس نود", add_node_apikey: "کلید API", add_node_confirm: "افزودن نود", add_node_invalid: "لطفاً URL و کلید API را وارد کنید.",
-                     node_added: "نود با موفقیت اضافه شد!", node_removed: "نود حذف شد.",
-                      deploy_btn: "هم‌اکنون نصب کن", update_deploying: "در حال نصب بروزرسانی...",
-                      update_success: "بروزرسانی موفق! در حال بارگذاری...", update_error: "خطا در بروزرسانی",
-                      lbl_cf_worker: "نام اسکریپت کارگر ابری", desc_cf_worker: "برای بروزرسانی خودکار الزامی است. نام اسکریپت در داشبورد کارگرهای ابری.",
-                      view_github: "مشاهده در گیت‌هاب",
-                     update_requires_cf: "برای نصب خودکار، شناسه اکانت، توکن API و نام کارگر را تنظیم کنید.",
-                     html_desc_strategy: "متغیرهای پشتیبانی شده: <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{FLAG}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{COUNTRY}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{CITY}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{ISP}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PROTOCOL}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{USER}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PORT}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{PREFIX}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{IP}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{HOST}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{DATE}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{INDEX}</code>، <code class='bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono'>{WORKER}</code>.<br><span class='text-[10px] text-slate-400 dark:text-slate-500 leading-snug'>• <b>{FLAG}</b>: ایموجی پرچم کشور (مثلاً 🇺🇸).<br>• <b>{COUNTRY}</b>: نام کشور (مثلاً United States).<br>• <b>{CITY}</b>: نام شهر (مثلاً San Francisco).<br>• <b>{ISP}</b>: نام ارائه‌دهنده اینترنت (مثلاً Cloudflare, Inc.).<br>• <b>{PROTOCOL}</b>: پروتکل اصلی هسته (VLESS / Trojan).<br>• <b>{USER}</b>: نام یا شناسه مشترک.<br>• <b>{PORT}</b>: پورت فعال اتصال.<br>• <b>{PREFIX}</b>: پیشوند نام دلخواه.<br>• <b>{IP}</b>: آدرس آی‌پی تمیز.<br>• <b>{HOST}</b>: نام دامنه هاست.<br>• <b>{DATE}</b>: تاریخ جاری (YYYY-MM-DD).<br>• <b>{INDEX}</b>: شماره ردیف کانفیگ (0, 1, 2...).<br>• <b>{WORKER}</b>: نام اسکریپت کارگر ابری.</span><br>طرح‌های از پیش تعریف شده: <code>default</code>، <code>type-user-port</code>، <code>user-port</code>، <code>host-port-user</code>، <code>prefix-user-port</code>، <code>ip</code>.",
-                }
           };
 
           const CHANGELOG_DATA = {
-              "2.9.0": {
-                  headline: { en: "Protocol Fix & Per-Config Node Routing", fa: "رفع پروتکل و مسیریابی نود به‌ازای هر کانفیگ" },
+              "1.1.0": {
+                  headline: { en: "Bug Fixes, Mobile UI & Security" },
                   added: [
-                      { en: "Per-config node routing for beta protocol via WebSocket path payload — beta nodes now route through their designated gateway IP just like alpha", fa: "مسیریابی نود به‌ازای هر کانفیگ پروتکل بتا از طریق مسیر وب‌ساکت — نودهای بتا اکنون مانند آلفا از طریق آدرس دروازه تعیین‌شده مسیریابی می‌کنند" },
-                      { en: "Server-side node index extraction with triple fallback: query parameter → numeric path segment → base64 JSON payload", fa: "استخراج شاخص نود سمت سرور با زنجیره سه‌گانه بازگشت: پارامتر کوئری → بخش عددی مسیر → بار پیلود JSON باینری" },
-                      { en: "Device connection limit per user (connLimit) — cap simultaneous connections per subscriber", fa: "محدودیت اتصال دستگاه به‌ازای هر کاربر (connLimit) — محدود کردن اتصالات همزمان هر مشترک" },
-                      { en: "Panel API key system for secure node-to-panel authentication", fa: "سیستم کلید API پنل برای احراز هویت امن اتصال نود به پنل" },
-                      { en: "Mobile-friendly add/edit user modals with improved responsive layout", fa: "فرم‌های افزودن/ویرایش کاربر سازگار با موبایل با طرح‌بندی واکنش‌گرا بهبودیافته" }
+                      { en: "Update notification banner restored — panel now detects new GitHub versions and offers one-click deploy" },
+                      { en: "Mobile bottom navigation with responsive grids — stats adapt to phone screens" },
+                      { en: "XSS protection on subscription page — user names are now HTML-escaped" },
+                      { en: "Shark emoji branding" }
                   ],
                   fixed: [
-                      { en: "Fixed beta protocol header offset parsing — beta connections were silently dropping payload data after the port field", fa: "رفع خطای اندازه‌گیری افست هدر پروتکل بتا — اتصالات بتا به‌طور خاموش داده پس از فیلد پورت را حذف می‌کردند" },
-                      { en: "Fixed beta protocol authentication — password was set to generated internal ID instead of raw user identifier, causing permanent auth failure", fa: "رفع احراز هویت پروتکل بتا — رمز عبور به‌جای شناسه داخلی تولیدشده از شناسه خام کاربر استفاده می‌کند" },
-                      { en: "Added SHA224 hash registration in configRegistry so beta lookup works when isolate is warm", fa: "افزودن ثبت هش SHA224 در configRegistry تا جستجوی بتا در isolate گرم کار کند" },
-                      { en: "Removed Maintenance Hosts and Sync API Key fields from Advanced tab network section as requested", fa: "حذف فیلدهای میزبان‌های نگهداری و کلید API همگام‌سازی از بخش شبکه پیشرفته" }
+                      { en: "Fake configs toggle not working — was missing CSS class and onclick handler" },
+                      { en: "Add/Edit User NAT64 field swap — each form now reads from its own field" },
+                      { en: "Duplicate element ID breaking network view active connections count" },
+                      { en: "Dashboard crash from missing ov-today-reqs element reference" },
+                      { en: "'swin shady' typo fixed to 'swim shady' everywhere" }
                   ],
                   improved: [
-                      { en: "Beta node routing now uses the same base64 JSON WebSocket path payload format as alpha for maximum client compatibility", fa: "مسیریابی نود بتا اکنون از همان قالب پیلود مسیر وب‌ساکت JSON باینری آلفا برای حداکثر سازگاری استفاده می‌کند" },
-                      { en: "Node resolution uses getEffectivePips with NAT64 awareness for both alpha and beta protocols", fa: "解析 نود از getEffectivePips با آگاهی NAT64 برای هر دو پروتکل آلفا و بتا استفاده می‌کند" },
-                      { en: "Added reqPath variable to buildYamlProfile for consistent path generation", fa: "افزودن متغیر reqPath به buildYamlProfile برای تولید مسیر یکپارچه" }
+                      { en: "Color contrast for better readability — muted text now meets WCAG standards" },
+                      { en: "Removed unused Persian translations from web dashboard" }
                   ],
                   notes: []
               },
-              "2.6.0": {
-                  headline: { en: "Bilingual Subscription Page & NAT64 Support", fa: "صفحه اشتراک چندزبانه و پشتیبانی NAT64" },
-                  added: [
-                      { en: "Full Persian and English language support on the subscription info page with RTL layout", fa: "پشتیبانی کامل از فارسی و انگلیسی در صفحه اطلاعات اشتراک با چیدمان RTL" },
-                      { en: "Dark and light mode toggle on the subscription page with saved preference", fa: "قابلیت تغییر حالت تاریک/روشن در صفحه اشتراک با ذخیره ترجیح کاربر" },
-                      { en: "NAT64 support for automatic IPv4 to IPv6 address conversion", fa: "پشتیبانی NAT64 برای تبدیل خودکار آدرس IPv4 به IPv6" },
-                      { en: "Per-user custom hostnames for multi-region deployments", fa: "هاست‌های اختصاصی برای هر کاربر جهت استقرار چند منطقه‌ای" },
-                      { en: "Direct connection configs that work without gateway IPs", fa: "کانفیگ‌های اتصال مستقیم بدون نیاز به آدرس دروازه" },
-                      { en: "Auto update from GitHub directly inside the dashboard", fa: "بروزرسانی خودکار از GitHub مستقیماً از داشبورد" },
-                      { en: "Customizable fake subscription entries with usage and expiry display", fa: "ورودی‌های اشتراک جعلی سفارشی با نمایش مصرف و انقضا" },
-                      { en: "Full gateway management via Telegram inline buttons", fa: "مدیریت کامل دروازه از طریق دکمه‌های اینلاین تلگرام" }
-                  ],
-                  fixed: [
-                      { en: "Fixed garbled Persian text in the user interface", fa: "اصلاح متن‌های فارسی نادرست در رابط کاربری" },
-                      { en: "Fixed subscription page not loading properly", fa: "رفع مشکل بارگذاری صفحه اشتراک" }
-                  ],
-                  improved: [
-                      { en: "Significantly faster dashboard scrolling and page loading", fa: "سرعت اسکرول و بارگذاری صفحات داشبورد بهبود چشمگیر یافت" },
-                      { en: "Rewritten config generators for better compatibility", fa: "بازنویسی مولدهای کانفیگ برای سازگاری بهتر" },
-                      { en: "Faster and more accurate country flag detection", fa: "سرعت و دقت نمایش پرچم کشورها بهبود یافت" },
-                      { en: "New config naming tags: country, city, ISP, date, and worker name", fa: "تگ‌های جدید نامگذاری: کشور، شهر، ارائه‌دهنده، تاریخ و نام ورکر" }
-                  ],
-                  notes: []
-              },
-              "2.5.8": {
-                  headline: { en: "Advanced Naming Tags & GeoIP Tag Engine", fa: "موتور نامگذاری پیشرفته با تگ‌های جغرافیایی" },
-                  added: [
-                      { en: "Added 7 new config naming placeholders: {COUNTRY}, {CITY}, {ISP}, {HOST}, {DATE}, {INDEX}, {WORKER}", fa: "اضافه شدن ۷ متغیر جدید نامگذاری: {COUNTRY}، {CITY}، {ISP}، {HOST}، {DATE}، {INDEX}، {WORKER}" },
-                      { en: "Replaced single-purpose flag API with batch ip-api.com GeoIP enrichment for country, city, and ISP data", fa: "جایگزینی API پرچم با غنی‌سازی GeoIP دسته‌ای ip-api.com برای داده‌های کشور، شهر و ارائه‌دهنده اینترنت" },
-                      { en: "Added tag validation engine that detects and reports unknown/invalid tags in naming strategies", fa: "افزودن موتور اعتبارسنجی تگ که تگ‌های ناشناخته یا نامعتبر در استراتژی نامگذاری را شناسایی و گزارش می‌کند" }
-                  ],
-                  fixed: [
-                      { en: "GeoIP cache now stores full geo metadata (country, city, ISP) instead of only flag emoji", fa: "کش GeoIP اکنون فراداده‌های کامل جغرافیایی (کشور، شهر، ارائه‌دهنده) را به جای فقط ایموجی پرچم ذخیره می‌کند" }
-                  ],
-                  improved: [
-                      { en: "Config name generation now receives config index for sequential naming patterns via {INDEX}", fa: "تولید نام کانفیگ اکنون شماره ردیف را برای الگوهای نامگذاری متوالی از طریق {INDEX} دریافت می‌کند" },
-                      { en: "Updated dashboard documentation with full list of all 13 supported naming tags in English and Persian", fa: "به‌روزرسانی مستندات داشبورد با لیست کامل ۱۳ تگ نامگذاری پشتیبانی شده در فارسی و انگلیسی" }
-                  ],
-                  notes: []
-              },
-              "2.5.7": {
-                  headline: { en: "Dynamic Multi-IP Failover & Keyless Country Flagging", fa: "لینک هوشمند آی‌پی‌ها، بهبود کلودفلر و نگاشت پرچم بدون تحریم" },
-                  added: [
-                      { en: "Support entering custom clean IPs, gateway IPs, and custom config names for each subscriber dynamically in Add/Edit user modals, with automatic extraction and seamless database merging", fa: "امکان ثبت آی‌پی تمیز دلخواه، آی‌پی دروازه دلخواه و نام کانفیگ دلخواه برای هر کاربر به صورت مجزا با قابلیت استخراج خودکار و ادغام هوشمند" },
-                      { en: "Integrated free, open-source and keyless api.country.is for country flag mapping of IP addresses", fa: "یکپارچه‌سازی وب‌سرویس رایگان و متن‌باز api.country.is جهت نگاشت پرچم کشورهای مربوط به آدرس‌های آی‌پی" }
-                  ],
-                  fixed: [
-                      { en: "Resolved Cloudflare API compatibility flag error ('No such compatibility flag: unsafe-eval' and startup 'Uncaught EvalError') by updating to 'allow_eval_during_startup'", fa: "رفع خطای ناسازگاری فلگ کلودفلر (خطای عدم وجود فلگ unsafe-eval و خطای زمان شروع کار EvalError) در بخش استقرار خودکار با بازنویسی به فلگ مدرن allow_eval_during_startup" },
-                      { en: "Fixed a critical issue where selecting multiple gateway IPs for a user caused session disruptions (IP splitting) on sites behind Cloudflare, resolved via user-consistent hashing and smart gateway failover", fa: "رفع مشکل عدم باز شدن وب‌سایت‌های پشت کلودفلر هنگام انتخاب چندین آی‌پی دروازه با پیاده‌سازی مکانیزم Hashing پایدار کاربر و سوییچ خودکار (Failover) بر روی دروازه‌های جایگزین" },
-                      { en: "Fixed client-side regular expression parsing to correctly split global IPs separated by backslashes, tabs, commas, or semicolons in the browser", fa: "اصلاح عبارات منظم فرانت‌اند در مروگر جهت تفکیک صحیح لیست آی‌پی‌های تفکیک شده با اینتر، ویرگول، نقطه ویرگول یا بک‌اسلش" }
-                  ],
-                  improved: [
-                      { en: "Enhanced reliability of user management dashboard modals and subscription validation logic", fa: "بهبود پایداری پنجره‌های مدیریتی داشبورد و منطق بررسی اعتبار اشتراک‌ها" }
-                  ],
-                  notes: []
-              },
-              "2.5.6.1": {
-                  headline: { en: "Multi-IP Management & Crucial Bug Fixes", fa: "مدیریت آی‌پی‌های چندگانه و رفع خطاهای بحرانی" },
-                  added: [
-                       { en: "Support setting custom config name, custom gateway IP, and custom clean IP for each user dynamically in the Add User modal", fa: "اضافه شدن امکان ثبت نام کانفیگ دلخواه، آی‌پی دروازه اختصاصی و آی‌پی تمیز اختصاصی به صورت مجزا برای هر کاربر در پنجره افزودن کاربر" }
-                  ],
-                  fixed: [
-                      { en: "Fixed a critical JavaScript rollback error ('ReferenceError: proxyIp is not defined') when adding a new user", fa: "رفع خطای بحرانی جاوااسکریپت ('ReferenceError: proxyIp is not defined') هنگام تلاش برای افزودن یک کاربر جدید" }
-                  ],
-                  improved: [
-                      { en: "Streamlined alignment of custom user values with subscription generation", fa: "بهبود همگام‌سازی مقادیر اختصاصی کاربران با فرایند ساخت کانفیگ‌ها در اشتراک" }
-                  ],
-                  notes: []
-              },
-              "2.5.6": {
-                  headline:                { en: "Multiple Gateway IPs & Flag Matching", fa: "آی‌پی‌های دروازه متعدد و انطباق پرچم" },
-                  added: [
-                      { en: "Support multi-gateway IP lists (rotated/distributed across generated configs to bypass Cloudflare limits)", fa: "پشتیبانی از لیست‌های آی‌پی دروازه چندگانه (چرخش و توزیع خودکار میان کانفیگ‌ها برای عبور از محدودیت‌های کلودفلر)" },
-                      { en: "Proper country flag matching for configs based on the actual gateway IP used", fa: "انطباق صحیح پرچم کشور برای کانفیگ‌ها بر اساس آی‌پی دروازه واقعی استفاده‌شده" }
-                  ],
-                  fixed: [
-                      { en: "Fixed outbound transport and websocket configurations formatting errors", fa: "رفع خطاهای فرمت‌دهی در کانفیگ‌های حمل و نقل خروجی و وب‌ساکت" }
-                  ],
-                  improved: [
-                      { en: "Distributed multiple gateway IPs evenly across subscription sub-configs", fa: "توزیع یکنواخت چندین آی‌پی دروازه میان زیرکانفیگ‌های اشتراک" },
-                      { en: "Enhanced IP API resolving and flag caching logic", fa: "بهبود منطق حل‌وفصل و کش پرچم برای آی‌پی‌ها" }
-                  ],
-                  notes: []
-              },
-              "2.5.5": {
-                  headline: { en: "One-Click Panel Update", fa: "بروزرسانی پنل با یک کلیک" },
-                  added: [
-                      { en: "Update the panel directly from the admin panel — no need to use Cloudflare dashboard", fa: "بروزرسانی پنل مستقیماً از پنل مدیریت — بدون نیاز به داشبورد کلودفلر" },
-                      { en: "One-click deployment inside the panel for quick and easy updates", fa: "نصب با یک کلیک داخل پنل برای بروزرسانی سریع و آسان" },
-                  ],
-                  fixed: [],
-                  improved: [
-                      { en: "Improved stability and reliability of the update system", fa: "بهبود پایداری و اطمینان سیستم بروزرسانی" },
-                  ],
-                  notes: []
-              },
-              "2.5.4.2": {
-                  headline: { en: "Performance Optimization & Background Processing", fa: "بهینه‌سازی عملکرد و پردازش پس‌زمینه" },
-                  added: [],
-                  fixed: [],
-                  improved: [
-                      { en: "Improved system performance using smart caching (faster responses and less database load)", fa: "بهبود عملکرد سیستم با استفاده از کش هوشمند (پاسخ‌ سریع‌تر و بار کمتر روی پایگاه داده)" },
-                      { en: "Added smart caching system (TTL) for configuration and usage data", fa: "افزودن سیستم کش هوشمند (TTL) برای داده‌های تنظیمات و مصرف" },
-                      { en: "Reduced database calls to make the panel faster and more efficient", fa: "کاهش درخواست‌ها به پایگاه داده برای سریع‌تر و کاراتر شدن پنل" },
-                      { en: "Background processing added for non-critical tasks to improve speed", fa: "افزودن پردازش پس‌زمینه برای کارهای غیربحرانی جهت بهبود سرعت" },
-                  ],
-                  notes: []
-              },
-              "2.5.4.1": {
-                  headline: { en: "Security Hotfix — Bot Authorization", fa: "اصلاح امنیتی — احراز هویت ربات" },
-                  added: [],
-                  fixed: [
-                      { en: "Fixed critical issue where unauthorized users could access bot and panel data via Worker", fa: "رفع مشکل بحرانی دسترسی کاربران غیرمجاز به اطلاعات ربات و پنل از طریق Worker" },
-                      { en: "Added proper Telegram user ID validation for all Worker-related requests", fa: "افزودن بررسی صحیح آیدی عددی تلگرام برای تمام درخواست‌های مربوط به Worker" },
-                  ],
-                  improved: [
-                      { en: "Only users with approved admin IDs can interact with the bot and access panel data", fa: "فقط کاربرانی که آیدی آن‌ها در لیست ادمین‌ها ثبت شده باشد اجازه دسترسی به ربات و اطلاعات پنل را دارند" },
-                      { en: "Unauthorized users now receive a clear access denied message", fa: "کاربران غیرمجاز اکنون پیام خطای دسترسی مناسب دریافت می‌کنند" },
-                  ],
-                  notes: [
-                      { en: "Security update — recommended for all users", fa: "به‌روزرسانی امنیتی — توصیه‌شده برای تمام کاربران" },
-                  ]
-              },
-              "2.5.4": {
-                  headline: { en: "Overview Dashboard & Mobile Improvements", fa: "داشبورد نمای کلی و بهبود نمایش در موبایل" },
-                  added: [
-                      { en: "Added Overview Dashboard as the default home page", fa: "اضافه شدن داشبورد نمای کلی به عنوان صفحه اصلی پنل" },
-                      { en: "Added quick statistics and recent activity section", fa: "اضافه شدن بخش آمار سریع و فعالیت‌های اخیر" },
-                  ],
-                  fixed: [],
-                  improved: [
-                      { en: "Improved mobile responsiveness of the Overview page", fa: "بهبود نمایش صفحه نمای کلی در موبایل" },
-                      { en: "Localized traffic units for Persian language", fa: "نمایش واحد ترافیک به فارسی در صفحه نمای کلی" },
-                  ],
-                  notes: []
-              },
-              "2.5.3": {
-                  headline: { en: "Telegram Bot Fixes & Formatting Cleanup", fa: "رفع مشکلات ربات تلگرام و اصلاح فرمت‌بندی" },
-                  added: [],
-                  fixed: [
-                      { en: "Fixed admin buttons not showing immediately after /start in some cases", fa: "رفع مشکل نمایش ندادن دکمه‌های مدیر بلافاصله پس از /start در بعضی موارد" },
-                      { en: "Fixed subscription link button returning per-user links instead of master link", fa: "رفع مشکل بازگشت لینک‌های کاربری به جای لینک اصلی هنگام فشردن دکمه لینک اشتراک" },
-                      { en: "Fixed duplicate messages when clicking Update Usage with unchanged stats", fa: "رفع مشکل ارسال پیام تکراری هنگام فشردن بروزرسانی مصرف بدون تغییر آمار" },
-                      { en: "Fixed <code> tags showing as raw text in Telegram messages", fa: "رفع مشکل نمایش تگ‌های <code> به صورت متن خام در پیام‌های تلگرام" },
-                      { en: "Fixed subscription links not being clickable in Telegram", fa: "رفع مشکل غیرقابل کلیک بودن لینک‌های اشتراک در تلگرام" },
-                  ],
-                  improved: [
-                      { en: "Subscription links now use tap-to-copy formatting in Telegram", fa: "لینک‌های اشتراک اکنون با فرمت کپی با یک لمس در تلگرام نمایش داده می‌شوند" },
-                      { en: "UUIDs now use tap-to-copy formatting in user lists and detail views", fa: "شناسه‌های یکتا اکنون با فرمت کپی با یک لمس در لیست و جزئیات کاربران نمایش داده می‌شوند" },
-                      { en: "Bot menu now correctly shows admin options on first interaction after login", fa: "منوی ربات اکنون گزینه‌های مدیریتی را در اولین تعامل پس از ورود به درستی نمایش می‌دهد" },
-                      { en: "Update Usage button now edits the existing message instead of sending a new one", fa: "دکمه بروزرسانی مصرف اکنون پیام موجود را ویرایش می‌کند به جای ارسال پیام جدید" },
-                  ],
-                  notes: [
-                      { en: "No breaking changes — fully backward compatible", fa: "بدون تغییرات ناسازگار — کاملاً سازگار با نسخه‌های قبلی" },
-                  ]
-              },
-              "2.5.2": {
-                  headline: { en: "Modal Responsiveness & Mobile UX", fa: "واکنش‌گرایی مودال و تجربه کاربری موبایل" },
-                  added: [],
-                  fixed: [],
-                  improved: [
-                      { en: "Improved Add/Edit User modal responsiveness on all screen sizes", fa: "بهبود واکنش‌گرایی مودال افزودن/ویرایش کاربر در تمام اندازه‌های صفحه" },
-                      { en: "Added sticky action buttons in modals for better mobile support", fa: "افزودن دکمه‌های شناور در مودال‌ها برای پشتیبانی بهتر از موبایل" },
-                      { en: "Enhanced scrolling behavior — form content scrolls independently while buttons stay visible", fa: "بهبود رفتار اسکرول — محتوای فرم به‌طور مستقل اسکرول می‌شود در حالی که دکمه‌ها قابل مشاهده باقی می‌مانند" },
-                      { en: "Improved overall user experience when managing subscribers", fa: "بهبود تجربه کاربری هنگام مدیریت مشترکین" },
-                  ],
-                  notes: [
-                      { en: "No breaking changes — fully backward compatible", fa: "بدون تغییرات ناسازگار — کاملاً سازگار با نسخه‌های قبلی" },
-                  ]
-              },
-              "2.5.1": {
-                  headline: { en: "Simplified Panel Management & Bot Stability", fa: "مدیریت ساده‌شده پنل و پایداری ربات" },
-                  added: [
-                      { en: "Web login signal system — bot auto-detects the last active web-logged panel", fa: "سیستم سیگنال ورود وب — ربات به‌طور خودکار آخرین پنل واردشده از وب را شناسایی می‌کند" },
-                      { en: "Login sync endpoint (/tg/sync_panel) for remote panels to notify the hub on admin login", fa: "نقطه پایانی همگام‌سازی ورود (/tg/sync_panel) برای اطلاع‌رسانی پنل‌های راهدور به هاب هنگام ورود مدیر" },
-                      { en: "Hub panel URL config (hubPanelUrl) for remote panels to signal login events", fa: "پیکربندی آدرس هاب پنل (hubPanelUrl) برای ارسال سیگنال ورود از پنل‌های راهدور" },
-                      { en: "Full user management via Telegram bot (create, edit, delete, search, disable, re-enable)", fa: "مدیریت کامل کاربران از طریق ربات تلگرام (ایجاد، ویرایش، حذف، جستجو، غیرفعال‌سازی، فعال‌سازی مجدد)" },
-                      { en: "HTTP REST API for all user operations at /api/users (GET, POST, PUT, DELETE)", fa: "API جدید REST برای تمام عملیات کاربران در /api/users" },
-                      { en: "Statistics API at /api/stats with user counts, traffic totals, and system status", fa: "API آمار در /api/stats با تعداد کاربران، مجموع ترافیک و وضعیت سیستم" },
-                  ],
-                  fixed: [
-                      { en: "Removed multi-panel selection system that caused session confusion and incorrect panel switching", fa: "حذف سیستم انتخاب چندپنلی که باعث سردرگمی نشست و جابجایی نادرست پنل می‌شد" },
-                      { en: "Fixed bot not responding after pressing /start due to stale step state", fa: "رفع مشکل پاسخ ندادن ربات پس از فشار دادن /start به دلیل وضعیت مرحله قدیمی" },
-                      { en: "Fixed panel context mixing when switching between panels", fa: "رفع مشکل ترکیب زمینه پنل هنگام جابجایی بین پنل‌ها" },
-                      { en: "Fixed race condition in bot state persistence from non-blocking D1 writes", fa: "رفع مشکل شرایط مسابقه در ماندگاری وضعیت ربات ناشی از نوشتن غیرهمزمان D1" },
-                  ],
-                  improved: [
-                      { en: "/start now directly opens panel management based on last web login — no panel selection menu", fa: "/start اکنون مستقیماً مدیریت پنل را بر اساس آخرین ورود وب باز می‌کند — بدون منوی انتخاب پنل" },
-                      { en: "Bot automatically links Telegram session to the last active web-logged panel", fa: "ربات به‌طور خودکار نشست تلگرام را به آخرین پنل فعال واردشده از وب متصل می‌کند" },
-                      { en: "Simplified bot logic with clean 1-to-1 mapping between web login and Telegram session", fa: "ساده‌سازی منطق ربات با نگاشت یک‌به‌یک بین ورود وب و نشست تلگرام" },
-                      { en: "Telegram bot main menu redesigned with inline keyboard layout for mobile-first management", fa: "منوی اصلی ربات تلگرام با طرح‌بندی کیبورد درون‌خطی برای مدیریت موبایل‌محور بازطراحی شد" },
-                  ],
-                  notes: [
-                      { en: "Single-panel mode works more reliably — it is recommended to use one Telegram bot per panel for best stability", fa: "حالت تک‌پنلی پایدارتر است — توصیه می‌شود برای بهترین پایداری از یک ربات تلگرام برای هر پنل استفاده کنید" },
-                      { en: "For multi-panel setups: set hubPanelUrl on each remote panel to enable automatic login sync", fa: "برای تنظیمات چندپنلی: hubPanelUrl را روی هر پنل راهدور تنظیم کنید تا همگام‌سازی خودکار ورود فعال شود" },
-                      { en: "Each panel having its own dedicated bot improves session accuracy and prevents panel mix-up issues", fa: "داشتن ربات اختصاصی برای هر پنل، دقت نشست را بهبود می‌دهد و از مشکلات ترکیب پنل جلوگیری می‌کند" },
-                      { en: "API endpoints are authenticated via Master Key (Bearer token or ?key= parameter)", fa: "نقاط پایانی API از طریق کلید اصلی احراز هویت می‌شوند (توکن Bearer یا پارامتر ?key=)" },
-                  ]
-              },
-              "2.5.0": {
-                  headline: { en: "User Auto-Disable & Management Improvements", fa: "غیرفعال‌سازی خودکار کاربر و بهبود مدیریت" },
-                  added: [
-                      { en: "Automatic user disable on traffic limit exceeded", fa: "غیرفعال‌سازی خودکار کاربر هنگام اتمام محدودیت ترافیک" },
-                      { en: "Automatic user disable on expiration date reached", fa: "غیرفعال‌سازی خودکار کاربر هنگام رسیدن به تاریخ انقضا" },
-                      { en: "Activity log and Telegram notification for auto-disabled users", fa: "ثبت در گزارش فعالیت و ارسال اعلان تلگرام برای کاربران غیرفعال شده خودکار" },
-                      { en: "Recently Disabled Users notification panel in Users tab", fa: "پنل اعلان کاربران اخیراً غیرفعال شده در بخش کاربران" },
-                      { en: "Status filter dropdown (All/Active/Paused/Auto-Disabled)", fa: "فیلتر وضعیت (همه/فعال/متوقف/غیرفعال خودکار)" },
-                      { en: "Auto-Disabled statistics card in dashboard", fa: "کارت آمار غیرفعال‌سازی خودکار در داشبورد" },
-                  ],
-                  fixed: [
-                      { en: "Expired users are now disabled instead of deleted", fa: "کاربران منقضی شده اکنون غیرفعال می‌شوند به جای حذف" },
-                      { en: "Users exceeding traffic limits are preserved in panel", fa: "کاربرانی که محدودیت ترافیک را رد می‌کنند در پنل حفظ می‌شوند" },
-                  ],
-                  improved: [
-                      { en: "User data, statistics, and history are now preserved", fa: "داده‌ها، آمار و تاریخچه کاربران اکنون حفظ می‌شود" },
-                      { en: "Account renewal workflow for administrators", fa: "فرآیند تمدید حساب برای مدیران" },
-                  ],
-                  notes: [
-                      { en: "Re-enabling a user clears the auto-disable reason", fa: "فعال‌سازی مجدد کاربر، دلیل غیرفعال‌سازی خودکار را پاک می‌کند" },
-                  ]
-              },
-              "2.4.9": {
-                  headline: { en: "Custom Protocol & Port Configuration", fa: "پیکربندی پروتکل و پورت سفارشی" },
-                  added: [
-                      { en: "Custom protocol mode per user (VLESS/Beta/Both)", fa: "حالت پروتکل سفارشی برای هر کاربر (VLESS/Beta/هر دو)" },
-                      { en: "Custom port configuration per user", fa: "پیکربندی پورت سفارشی برای هر کاربر" },
-                      { en: "Maximum configs limit per user", fa: "محدودیت حداکثر کانفیگ برای هر کاربر" },
-                  ],
-                  fixed: [],
-                  improved: [
-                      { en: "User management panel interface", fa: "رابط کاربری پنل مدیریت کاربران" },
-                  ],
-                  notes: []
-              }
           };
   
           function renderChangelog(version) {
@@ -6950,52 +6641,7 @@ function getDashboardUI(hasDB) {
               checkVersionPopup();
           });
   
-          function applyLang() {
-              document.documentElement.dir = 'ltr';
-              var langEl = document.getElementById('lang-toggle');
-              if (langEl) langEl.innerText = 'en';
-              document.querySelectorAll('[data-i18n]').forEach(el => {
-                  const key = el.getAttribute('data-i18n');
-                  if (i18n[lang] && i18n[lang][key] !== undefined && i18n[lang][key] !== null) {
-                      if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-                          el.placeholder = i18n[lang][key];
-                      } else {
-                          if (key.startsWith('html_')) {
-                              el.innerHTML = i18n[lang][key];
-                          } else {
-                              el.innerText = i18n[lang][key];
-                          }
-                      }
-                  }
-              });
-              document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
-                  const key = el.getAttribute('data-i18n-placeholder');
-                  if (i18n[lang] && i18n[lang][key] !== undefined && i18n[lang][key] !== null) {
-                      el.placeholder = i18n[lang][key];
-                  }
-              });
-              const gbUnit = i18n[lang]?.ov_gb_unit || 'GB';
-              ['ov-total-traffic','ov-today-traffic'].forEach(id => {
-                  const el = document.getElementById(id);
-                  if (el && el.textContent.trim() === '- GB') el.textContent = '- ' + gbUnit;
-              });
-              const statTrafficEl = document.getElementById('stat-total-traffic');
-              if (statTrafficEl && statTrafficEl.textContent.trim() === '0 GB') statTrafficEl.textContent = '0 ' + gbUnit;
-          }
-          function toggleLang() { 
-              lang = lang === 'fa' ? 'en' : 'fa'; 
-              localStorage.setItem('lang', lang); 
-              applyLang(); 
-              updateTitle(); 
-              updateUI(); 
-              try {
-                  const m = document.getElementById('modal-version-update');
-                  if (m && !m.classList.contains('hidden')) {
-                      renderChangelog(CURRENT_VERSION);
-                  }
-              } catch(e){}
-          }
-          applyLang();
+
   
           if (localStorage.getItem('theme') === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
               document.documentElement.classList.add('dark');
@@ -7147,8 +6793,9 @@ function getDashboardUI(hasDB) {
                     document.getElementById('ov-total-traffic').textContent = s.traffic.totalGB + ' ' + (i18n[lang]?.ov_gb_unit || 'GB');
                     document.getElementById('ov-total-reqs').textContent = s.traffic.totalRequests.toLocaleString();
                     document.getElementById('ov-today-traffic').textContent = s.traffic.dailyGB + ' ' + (i18n[lang]?.ov_gb_unit || 'GB');
-                    document.getElementById('ov-today-reqs').textContent = s.traffic.dailyRequests.toLocaleString();
                     document.getElementById('ov-active-conns').textContent = s.system.activeConnections;
+                    var netConnsEl = document.getElementById('net-active-conns');
+                    if (netConnsEl) netConnsEl.textContent = s.system.activeConnections;
                     document.getElementById('ov-version').textContent = 'v' + s.system.version;
                 }
 
@@ -7321,10 +6968,10 @@ function getDashboardUI(hasDB) {
                   const item = document.createElement('div');
                   item.className = 'flex items-center gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder/50';
                   item.innerHTML = \`
-                      <div style="position:relative;cursor:pointer;flex-shrink:0" onclick="document.querySelector('#fake-cb-\${idx}').checked = !document.querySelector('#fake-cb-\${idx}').checked; this.classList.toggle('on')">
-                          <input type="checkbox" id="fake-cb-\${idx}" \${cfg.enabled ? 'checked' : ''} onchange="toggleFakeConfig(\${idx})" class="sr-only" style="display:none">
-                          <div style="width:32px;height:18px;background:#222;border-radius:9px;position:relative;transition:background 0.15s">
-                              <div style="width:14px;height:14px;background:#444;border-radius:50%;position:absolute;top:2px;left:2px;transition:all 0.15s" class="toggle-knob"></div>
+                      <div class="toggle \${cfg.enabled ? 'on' : ''}" style="position:relative;cursor:pointer;flex-shrink:0" onclick="this.classList.toggle('on'); toggleFakeConfig(\${idx})">
+                          <input type="checkbox" id="fake-cb-\${idx}" \${cfg.enabled ? 'checked' : ''} class="sr-only" style="display:none">
+                          <div style="width:36px;height:20px;border-radius:10px;position:relative;transition:background 0.15s">
+                              <div style="width:16px;height:16px;border-radius:50%;position:absolute;top:2px;transition:all 0.15s" class="toggle-knob"></div>
                           </div>
                       </div>
                       <input type="text" value="\${cfg.name.replace(/"/g, '&quot;')}" onchange="updateFakeConfigName(\${idx}, this.value)" class="flex-1 min-w-0 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-darkborder bg-white dark:bg-slate-900 focus:border-primary outline-none text-sm font-mono">
@@ -7969,7 +7616,6 @@ function getDashboardUI(hasDB) {
                   tblHtml += '</div>';
               });
               tbl.innerHTML = tblHtml;
-              applyLang();
           }
 
           async function resetUserTraffic(uuid) {
@@ -8211,7 +7857,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                if (nodesCheckbox) nodesArray.push(...nodesCheckbox.split(','));
                if (nodesCustom) nodesArray.push(...nodesCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
                const userNodes = nodesArray.length ? nodesArray.join(',') : null;
-               const nat64 = document.getElementById('edit-user-nat64').value.trim() || null;
+               const nat64 = document.getElementById('add-user-nat64').value.trim() || null;
                
                if(!name) {
                    alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
@@ -8389,7 +8035,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                if (nodesCheckbox) nodesArray.push(...nodesCheckbox.split(','));
                if (nodesCustom) nodesArray.push(...nodesCustom.split(/[\\s,;]+/).map(s=>s.trim()).filter(Boolean));
                const userNodes = nodesArray.length ? nodesArray.join(',') : null;
-                const nat64 = document.getElementById('add-user-nat64').value.trim() || null;
+                const nat64 = document.getElementById('edit-user-nat64').value.trim() || null;
                 let connLimit = document.getElementById('edit-user-conn-limit').value;
                 connLimit = connLimit ? parseInt(connLimit) : null;
                 const userPanelUrl = document.getElementById('edit-user-panel-url').value.trim() || null;
