@@ -41,11 +41,12 @@ Default password: `admin`
 
 | Client | Platform |
 |--------|----------|
-| Clash Verge / Mihomo | Desktop |
 | Sing-box | Desktop / Mobile |
 | V2rayNG | Android |
 | Streisand | iOS |
+| v2box | iOS |
 | Nekobox | Desktop |
+| V2rayN | Desktop |
 
 ## Dashboard
 
