@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "1.1.0";
+const CURRENT_VERSION = "1.2.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -302,6 +302,12 @@ function trackUsage(uuid, bytes, env, ctx) {
                 ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(()=>{}));
             }
             ctx?.waitUntil(cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
+            // Persist uuidUsage to D1 so live connection data survives isolate restarts
+            let uuidUsageObj = {};
+            for(let [k,v] of uuidUsage.entries()) uuidUsageObj[k] = v;
+            if (Object.keys(uuidUsageObj).length > 0) {
+                ctx?.waitUntil(cachedD1Put(env, "uuid_usage", JSON.stringify(uuidUsageObj)).catch(()=>{}));
+            }
         }
     }
 }
@@ -332,6 +338,7 @@ export default {
                 stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
                 update: `/${encodeURI(sysConfig.apiRoute)}/api/update`,
                 apiKeys: `/${encodeURI(sysConfig.apiRoute)}/api/keys`,
+                doh: `/${encodeURI(sysConfig.apiRoute)}/dns-query`,
             };
 
             const isSyncRoute = reqPath.endsWith('/api/sync');
@@ -339,7 +346,8 @@ export default {
             const isStatsRoute = reqPath === routes.stats || reqPath.endsWith('/api/stats');
             const isUpdateRoute = reqPath === routes.update || reqPath.endsWith('/api/update');
             const isApiKeysRoute = reqPath === routes.apiKeys || reqPath.endsWith('/api/keys');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute || isApiKeysRoute;
+            const isDohRoute = reqPath === routes.doh || reqPath.endsWith('/dns-query');
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute || isApiKeysRoute || isDohRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -378,6 +386,9 @@ export default {
                 }
                 if (isApiKeysRoute) {
                     return await handleApiKeys(request, env, ctx);
+                }
+                if (reqPath === routes.doh || reqPath.endsWith('/dns-query')) {
+                    return await handleDoH(request, env);
                 }
                 if (reqPath === routes.syncPanel) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -635,6 +646,9 @@ function serveSubscriptionInfoPage(user, host, url, request) {
 
     let syncNormal = cleanUrl.href;
     let syncRaw = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=a' : '?flag=a');
+    let syncClash = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=clash' : '?flag=clash');
+    let syncSingbox = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=singbox' : '?flag=singbox');
+    let panelName = sysConfig.name || 'SwimShady';
 
     const html = `<!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -809,22 +823,72 @@ function serveSubscriptionInfoPage(user, host, url, request) {
 
         <!-- Connection Options -->
         <div class="space-y-4">
-            <div class="card-inner p-5 rounded-2xl relative">
+            <!-- Universal Link -->
+            <div class="card-inner p-5 relative">
                 <div class="flex items-center justify-between mb-3">
                     <div>
-                        <span class="text-xs font-bold" style="color: var(--green-text);" data-i18n="universalLink">Universal Auto-Detecting Configuration Link</span>
-                        <p class="text-[11px] text-secondary mt-1" data-i18n="universalDesc">This universal URL automatically detects your client and delivers the optimal format.</p>
+                        <span class="text-xs font-bold" style="color: var(--green-text);">Universal Auto-Detect</span>
+                        <p class="text-[11px] text-secondary mt-1">Auto-detects your client and delivers the optimal format.</p>
                     </div>
                 </div>
                 <div>
                     <input type="text" id="sub-norm" readonly value="${syncNormal}" class="input-field w-full px-4 py-3 text-xs font-mono truncate outline-none" style="color: var(--text-2);">
                 </div>
-                <p class="text-[10px] text-muted mt-2" data-i18n="universalNote">Real-time import of complete nodes list with dynamic configuration update.</p>
+                <p class="text-[10px] text-muted mt-2">Real-time import with dynamic configuration update.</p>
                 <div class="flex gap-2 mt-3">
                     <button onclick="copyLink('sub-norm')" class="btn-primary px-4 py-2 text-xs font-bold">Copy</button>
                     <button onclick="showQRModal()" class="btn-secondary px-4 py-2 text-xs font-bold">QR</button>
                 </div>
             </div>
+
+            <!-- Format Links -->
+            <div class="card-inner p-5 relative">
+                <div class="mb-4">
+                    <span class="text-xs font-bold" style="color: var(--text);">Format-Specific Links</span>
+                    <p class="text-[11px] text-secondary mt-1">Copy the link for your specific client app.</p>
+                </div>
+
+                <!-- Clash / Mihomo -->
+                <div class="mb-4">
+                    <div class="flex items-center gap-2 mb-2">
+                        <span class="text-[10px] font-bold px-2 py-0.5" style="background: var(--accent-dim); color: var(--accent); border: 1px solid var(--green-border);">CLASH</span>
+                        <span class="text-[10px] text-muted">Clash Verge, Mihomo, Clash Meta, Stash, FLClash</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <input type="text" id="sub-clash" readonly value="${syncClash}" class="input-field flex-1 px-3 py-2 text-[11px] font-mono truncate outline-none" style="color: var(--text-2);">
+                        <button onclick="copyLink('sub-clash')" class="btn-primary px-3 py-2 text-[10px] font-bold">Copy</button>
+                    </div>
+                </div>
+
+                <!-- Sing-box -->
+                <div class="mb-4">
+                    <div class="flex items-center gap-2 mb-2">
+                        <span class="text-[10px] font-bold px-2 py-0.5" style="background: rgba(59,130,246,0.1); color: var(--blue); border: 1px solid rgba(59,130,246,0.2);">SING-BOX</span>
+                        <span class="text-[10px] text-muted">Sing-box, Hiddify, NekoBox, Streisand, V2rayNG</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <input type="text" id="sub-singbox" readonly value="${syncSingbox}" class="input-field flex-1 px-3 py-2 text-[11px] font-mono truncate outline-none" style="color: var(--text-2);">
+                        <button onclick="copyLink('sub-singbox')" class="btn-primary px-3 py-2 text-[10px] font-bold">Copy</button>
+                    </div>
+                </div>
+
+                <!-- Raw / Base64 -->
+                <div>
+                    <div class="flex items-center gap-2 mb-2">
+                        <span class="text-[10px] font-bold px-2 py-0.5" style="background: rgba(251,191,36,0.1); color: var(--amber); border: 1px solid rgba(251,191,36,0.2);">RAW</span>
+                        <span class="text-[10px] text-muted">V2rayN, v2rayNG (manual import), Nekoray</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <input type="text" id="sub-raw" readonly value="${syncRaw}" class="input-field flex-1 px-3 py-2 text-[11px] font-mono truncate outline-none" style="color: var(--text-2);">
+                        <button onclick="copyLink('sub-raw')" class="btn-primary px-3 py-2 text-[10px] font-bold">Copy</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Credits -->
+        <div class="text-center mt-6">
+            <p class="text-[10px] text-muted font-mono">Powered by <span style="color: var(--accent);">${esc(panelName)}</span></p>
         </div>
     </div>
 
@@ -929,6 +993,18 @@ async function loadSysConfig(env) {
                 }).finally(() => { sysUsageLoading = null; });
             }
             await sysUsageLoading;
+        }
+        // Load uuidUsage from D1 to restore live connection data after isolate restart
+        if (uuidUsage.size === 0) {
+            try {
+                const uuidStored = await d1Get(env, "uuid_usage");
+                if (uuidStored) {
+                    const parsed = JSON.parse(uuidStored);
+                    for (let [k, v] of Object.entries(parsed)) {
+                        uuidUsage.set(k, v);
+                    }
+                }
+            } catch(e) {}
         }
     }
 
@@ -1383,6 +1459,130 @@ async function handleUpdateApi(request, env, ctx) {
         return new Response(JSON.stringify({ success: false, error: "Invalid action" }), { status: 400, headers: { "Content-Type": "application/json" } });
     } catch(e) {
         return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+}
+
+async function handleDoH(request, env) {
+    try {
+        const upstreamDns = sysConfig.customDns || 'https://cloudflare-dns.com/dns-query';
+        const url = new URL(request.url);
+        
+        // Ad/tracker blocklist
+        const adBlocklist = [
+            'doubleclick.net', 'googlesyndication.com', 'googleadservices.com',
+            'google-analytics.com', 'googletagmanager.com', 'googletagservices.com',
+            'ads.youtube.com', 'ad.yieldmanager.com', 'advertising.com',
+            'ads.facebook.com', 'an.facebook.com', 'pixel.facebook.com',
+            'analytics.twitter.com', 'ads.twitter.com', 'platform.twitter.com',
+            'ads.tiktok.com', 'analytics.tiktok.com',
+            'ads.linkedin.com', 'snap.licdn.com',
+            'adnxs.com', 'adsrvr.org', 'advertising.com', 'amazon-adsystem.com',
+            'casalemedia.com', 'contextweb.com', 'doubleclick.net',
+            'demdex.net', 'everesttech.net', 'mathtag.com',
+            'quantserve.com', 'scorecardresearch.com', 'bluekai.com',
+            'bounceexchange.com', 'chartbeat.com', 'chartbeat.net',
+            'crazyegg.com', 'hotjar.com', 'heap.io', 'mixpanel.com',
+            'segment.io', 'segment.com', 'amplitude.com',
+            'appsflyer.com', 'branch.io', 'adjust.com', 'kochava.com',
+            'singular.net', 'tenjin.com',
+            'taboola.com', 'outbrain.com', 'revcontent.com', 'mgid.com',
+            'criteo.com', 'criteo.net', 'pubmatic.com', 'rubiconproject.com',
+            'openx.com', 'sharethrough.com', 'teads.tv',
+            'moat.com', 'moatads.com', 'adsafeprotected.com',
+            'ipify.org', 'ipinfo.io', 'whatismyip.com', 'myip.com',
+            'browserleaks.com', 'whoer.net', 'whoislookup.com'
+        ];
+        
+        // Check if domain should be blocked
+        function isBlocked(domain) {
+            const d = domain.toLowerCase();
+            return adBlocklist.some(blocked => d === blocked || d.endsWith('.' + blocked));
+        }
+        
+        // Handle GET request with DNS JSON API
+        if (request.method === 'GET') {
+            const dnsName = url.searchParams.get('name');
+            const dnsType = url.searchParams.get('type') || 'A';
+            
+            if (!dnsName) {
+                return new Response(JSON.stringify({ Status: 1, TC: false, RD: true, RA: true, AD: false, CD: false, Question: [], Answer: [] }), {
+                    headers: { 'Content-Type': 'application/dns-json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            
+            // Check if domain is blocked
+            if (isBlocked(dnsName)) {
+                return new Response(JSON.stringify({ Status: 0, TC: false, RD: true, RA: true, AD: false, CD: false, Question: [{ name: dnsName, type: dnsType }], Answer: [] }), {
+                    headers: { 'Content-Type': 'application/dns-json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            
+            try {
+                const dohUrl = new URL(upstreamDns);
+                dohUrl.searchParams.set('name', dnsName);
+                dohUrl.searchParams.set('type', dnsType);
+                
+                const res = await fetch(dohUrl.toString(), { headers: { 'accept': 'application/dns-json' } });
+                const data = await res.json();
+                
+                return new Response(JSON.stringify(data), {
+                    headers: { 'Content-Type': 'application/dns-json', 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch(e) {
+                return new Response(JSON.stringify({ Status: 2, TC: false, RD: true, RA: true, AD: false, CD: false, Question: [], Answer: [] }), {
+                    headers: { 'Content-Type': 'application/dns-json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+        
+        // Handle POST request (RFC 8484 wire format)
+        if (request.method === 'POST') {
+            const contentType = request.headers.get('content-type') || '';
+            
+            if (contentType.includes('application/dns-message')) {
+                // Wire format - forward to upstream
+                const body = await request.arrayBuffer();
+                const res = await fetch(upstreamDns, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/dns-message', 'accept': 'application/dns-message' },
+                    body: body
+                });
+                const result = await res.arrayBuffer();
+                return new Response(result, {
+                    headers: { 'Content-Type': 'application/dns-message', 'Access-Control-Allow-Origin': '*' }
+                });
+            } else if (contentType.includes('application/dns-json')) {
+                // JSON format
+                const body = await request.json();
+                const dohUrl = new URL(upstreamDns);
+                const res = await fetch(dohUrl.toString(), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/dns-json', 'accept': 'application/dns-json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                return new Response(JSON.stringify(data), {
+                    headers: { 'Content-Type': 'application/dns-json', 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+        }
+        
+        // Handle CORS preflight
+        if (request.method === 'OPTIONS') {
+            return new Response(null, {
+                status: 204,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, accept',
+                    'Access-Control-Max-Age': '86400'
+                }
+            });
+        }
+        
+        return new Response('DNS-over-HTTPS endpoint', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+    } catch(e) {
+        return new Response('Internal Server Error', { status: 500 });
     }
 }
 
@@ -5721,6 +5921,15 @@ function getDashboardUI(hasDB) {
                                               <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_doh">Custom DNS (DoH Provider)</label>
                                               <input type="text" id="cfg-custom-dns" placeholder="https://cloudflare-dns.com/dns-query" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                                           </div>
+                                          <div class="space-y-1 md:col-span-2">
+                                              <label class="block text-sm font-bold text-slate-600 dark:text-slate-300">Private DoH Server</label>
+                                              <p class="text-[11px] text-slate-400 mb-2">Your private DNS-over-HTTPS endpoint. Use this in your clients instead of public DNS for privacy and censorship bypass.</p>
+                                              <div class="flex gap-2">
+                                                  <input type="text" id="cfg-doh-server" readonly class="flex-1 px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 text-sm font-mono" style="color: var(--text-2);">
+                                                  <button onclick="copyDoHServer()" class="px-4 py-2 bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-xl text-xs font-bold transition-all">Copy</button>
+                                              </div>
+                                              <p class="text-[10px] text-slate-500 mt-1">Add <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">/dns-query</code> to your client's DNS settings.</p>
+                                          </div>
                                       </div>
                                   </div>
                               </div>
@@ -6551,6 +6760,24 @@ function getDashboardUI(hasDB) {
           };
 
           const CHANGELOG_DATA = {
+              "1.2.0": {
+                  headline: { en: "DoH Server, Ad Blocking & Subscription Format Links" },
+                  added: [
+                      { en: "Private DoH Server endpoint — use your worker as a DNS-over-HTTPS server for privacy and censorship bypass" },
+                      { en: "DNS-based ad blocking — blocks 60+ ad/tracker domains including Google, Facebook, TikTok, and analytics trackers" },
+                      { en: "Subscription page format buttons — copy links for Clash, Sing-box, and Raw formats with app hints" },
+                      { en: "Live connection data persistence — active connection counts now survive worker restarts via D1" },
+                      { en: "Panel name displayed in subscription page credits" }
+                  ],
+                  fixed: [
+                      { en: "Live profile usage always showing 'No active connection data yet' — data now persists to D1" }
+                  ],
+                  improved: [
+                      { en: "Subscription page now shows which app works with which format (Clash Verge, Sing-box, V2rayNG, etc.)" },
+                      { en: "DoH server supports GET (JSON API) and POST (RFC 8484 wire format) with CORS headers" }
+                  ],
+                  notes: []
+              },
               "1.1.0": {
                   headline: { en: "Bug Fixes, Mobile UI & Security" },
                   added: [
@@ -7253,6 +7480,7 @@ function getDashboardUI(hasDB) {
                       renderUsersTable();
                       renderLinkedNodes();
                       renderProfiles();
+                      updateDoHServerUrl();
                       try { checkUpdate(); } catch(ue) { console.error(ue); }
                        if (!silent) switchTab('overview');
 
@@ -8153,6 +8381,22 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               navigator.clipboard.writeText(input.value);
               const stat = document.getElementById('save-status');
               if (stat) { stat.textContent = "Copied!"; stat.className = "text-sm font-bold text-emerald-500 md:me-4"; setTimeout(() => { stat.textContent = ""; }, 2000); }
+          }
+
+          function copyDoHServer() {
+              const input = document.getElementById('cfg-doh-server');
+              if (input && input.value) {
+                  navigator.clipboard.writeText(input.value);
+                  const stat = document.getElementById('save-status');
+                  if (stat) { stat.textContent = "Copied!"; stat.className = "text-sm font-bold text-emerald-500 md:me-4"; setTimeout(() => { stat.textContent = ""; }, 2000); }
+              }
+          }
+
+          function updateDoHServerUrl() {
+              const dohInput = document.getElementById('cfg-doh-server');
+              if (dohInput) {
+                  dohInput.value = window.location.origin + '/' + (window.nahanConfig?.apiRoute || 'sync') + '/dns-query';
+              }
           }
 
           async function doSaveDirectly() {

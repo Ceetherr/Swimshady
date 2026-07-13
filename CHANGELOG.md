@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.2.0
+
+### Added
+- Private DoH Server endpoint — use your worker as a DNS-over-HTTPS server for privacy and censorship bypass
+- DNS-based ad blocking — blocks 60+ ad/tracker domains including Google, Facebook, TikTok, and analytics trackers
+- Subscription page format buttons — copy links for Clash, Sing-box, and Raw formats with app hints
+- Live connection data persistence — active connection counts now survive worker restarts via D1
+- Panel name displayed in subscription page credits
+
+### Fixed
+- Live profile usage always showing "No active connection data yet" — data now persists to D1
+
+### Improved
+- Subscription page now shows which app works with which format (Clash Verge, Sing-box, V2rayNG, etc.)
+- DoH server supports GET (JSON API) and POST (RFC 8484 wire format) with CORS headers
+
 ## v1.1.0
 
 ### Added
