@@ -1480,7 +1480,7 @@ async function handleDoH(request, env) {
             'ads.tiktok.com', 'analytics.tiktok.com',
             'ads.linkedin.com', 'snap.licdn.com',
             'adnxs.com', 'adsrvr.org', 'advertising.com', 'amazon-adsystem.com',
-            'casalemedia.com', 'contextweb.com', 'doubleclick.net',
+            'casalemedia.com', 'contextweb.com',
             'demdex.net', 'everesttech.net', 'mathtag.com',
             'quantserve.com', 'scorecardresearch.com', 'bluekai.com',
             'bounceexchange.com', 'chartbeat.com', 'chartbeat.net',
@@ -4338,7 +4338,6 @@ dns:
   listen: 127.0.0.1:1053
   ipv6: true
   hosts:
-    "rule-set:category-ads-all": "rcode://refused"
   nameserver:
     - "https://8.8.8.8/dns-query#✅ Selector"
   proxy-server-nameserver:
@@ -4389,39 +4388,6 @@ ${allProxies}
 ${bestPingProxies}
 
 rules:
-  # Ad blocking rules
-  - DOMAIN-SUFFIX,doubleclick.net,REJECT
-  - DOMAIN-SUFFIX,googlesyndication.com,REJECT
-  - DOMAIN-SUFFIX,googleadservices.com,REJECT
-  - DOMAIN-SUFFIX,google-analytics.com,REJECT
-  - DOMAIN-SUFFIX,googletagmanager.com,REJECT
-  - DOMAIN-SUFFIX,ads.youtube.com,REJECT
-  - DOMAIN-SUFFIX,ads.facebook.com,REJECT
-  - DOMAIN-SUFFIX,analytics.facebook.com,REJECT
-  - DOMAIN-SUFFIX,ads.tiktok.com,REJECT
-  - DOMAIN-SUFFIX,analytics.tiktok.com,REJECT
-  - DOMAIN-SUFFIX,ads.twitter.com,REJECT
-  - DOMAIN-SUFFIX,analytics.twitter.com,REJECT
-  - DOMAIN-SUFFIX,ads.linkedin.com,REJECT
-  - DOMAIN-SUFFIX,adnxs.com,REJECT
-  - DOMAIN-SUFFIX,adsrvr.org,REJECT
-  - DOMAIN-SUFFIX,casalemedia.com,REJECT
-  - DOMAIN-SUFFIX,demdex.net,REJECT
-  - DOMAIN-SUFFIX,doubleclick.net,REJECT
-  - DOMAIN-SUFFIX,everesttech.net,REJECT
-  - DOMAIN-SUFFIX,mathtag.com,REJECT
-  - DOMAIN-SUFFIX,quantserve.com,REJECT
-  - DOMAIN-SUFFIX,scorecardresearch.com,REJECT
-  - DOMAIN-SUFFIX,taboola.com,REJECT
-  - DOMAIN-SUFFIX,outbrain.com,REJECT
-  - DOMAIN-SUFFIX,criteo.com,REJECT
-  - DOMAIN-SUFFIX,criteo.net,REJECT
-  - DOMAIN-SUFFIX,pubmatic.com,REJECT
-  - DOMAIN-SUFFIX,rubiconproject.com,REJECT
-  - DOMAIN-SUFFIX,openx.com,REJECT
-  - DOMAIN-SUFFIX,moat.com,REJECT
-  - DOMAIN-SUFFIX,moatads.com,REJECT
-  - DOMAIN-SUFFIX,adsafeprotected.com,REJECT
   # Iran bypass rules
   - DOMAIN-SUFFIX,ir,DIRECT
   - DOMAIN-KEYWORD,gov.ir,DIRECT
@@ -4671,9 +4637,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
             "use-system-hosts": false,
             "listen": "127.0.0.1:1053",
             "ipv6": true,
-            "hosts": {
-                "rule-set:category-ads-all": "rcode://refused"
-            },
+            "hosts": {},
             "nameserver": [
                 "https://8.8.8.8/dns-query#✅ Selector"
             ],
@@ -4729,14 +4693,6 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
             }
         ],
         "rule-providers": {
-            "category-ads-all": {
-                "type": "http",
-                "format": "text",
-                "behavior": "domain",
-                "path": "./ruleset/category-ads-all.txt",
-                "interval": 86400,
-                "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-clash-rules/release/category-ads-all.txt"
-            },
             "ir": {
                 "type": "http",
                 "format": "text",
@@ -4757,7 +4713,6 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
         "rules": [
             "GEOIP,lan,DIRECT,no-resolve",
             "NETWORK,udp,REJECT",
-            "RULE-SET,category-ads-all,REJECT",
             "RULE-SET,ir,DIRECT",
             "RULE-SET,ir-cidr,DIRECT",
             "MATCH,✅ Selector"
@@ -4991,12 +4946,6 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                     "action": "reject"
                 },
                 {
-                    "rule_set": [
-                        "geosite-category-ads-all"
-                    ],
-                    "action": "reject"
-                },
-                {
                     "type": "logical",
                     "mode": "and",
                     "rules": [
@@ -5093,12 +5042,6 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                 },
                 {
                     "rule_set": [
-                        "geosite-category-ads-all"
-                    ],
-                    "action": "reject"
-                },
-                {
-                    "rule_set": [
                         "geosite-ir"
                     ],
                     "action": "route",
@@ -5113,13 +5056,6 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                 }
             ],
             "rule_set": [
-                {
-                    "type": "remote",
-                    "tag": "geosite-category-ads-all",
-                    "format": "binary",
-                    "url": "https://raw.githubusercontent.com/Chocolate4U/Iran-sing-box-rules/rule-set/geosite-category-ads-all.srs",
-                    "download_detour": "direct"
-                },
                 {
                     "type": "remote",
                     "tag": "geosite-ir",
