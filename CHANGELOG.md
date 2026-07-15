@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.1
+
+### Fixed
+- Custom Config Name not applied — user `customName` field was never saved on create/update and was not used in config name generation
+- Custom Config Name not shown in subscription links — profile builders now pass per-user `customName` to `getConfigName`
+- Subscription info page now displays custom name instead of internal user name
+- Update notification banner not showing — inline `style="display:none"` was overriding Tailwind `hidden` class, preventing the banner from ever becoming visible
+
 ## v1.2.0
 
 ### Added

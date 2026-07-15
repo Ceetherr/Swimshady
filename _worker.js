@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "1.2.0";
+const CURRENT_VERSION = "1.2.1";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -648,6 +648,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     let syncRaw = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=a' : '?flag=a');
     let syncClash = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=clash' : '?flag=clash');
     let syncSingbox = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=singbox' : '?flag=singbox');
+    let displayName = user.customName || user.name;
     let panelName = sysConfig.name || 'SwimShady';
 
     const html = `<!DOCTYPE html>
@@ -655,7 +656,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${esc(user.name)} - Subscriber Portal</title>
+    <title>${esc(displayName)} - Subscriber Portal</title>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         * { border-radius: 0; box-shadow: none !important; }
@@ -761,7 +762,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
                     <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
                 </div>
                 <div>
-                    <h1 class="text-xl md:text-2xl font-black tracking-tight" style="color: var(--text);">${esc(user.name)}</h1>
+                    <h1 class="text-xl md:text-2xl font-black tracking-tight" style="color: var(--text);">${esc(displayName)}</h1>
                     <p class="text-xs mt-1 font-mono" style="color: var(--text-3);">${user.id}</p>
                 </div>
             </div>
@@ -1220,19 +1221,20 @@ async function handleUsersApi(request, env, ctx) {
 
         if (method === "POST" && !userId) {
             const body = await request.json();
-            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts, userNodes, nat64, connLimit, userPanelUrl } = body;
+            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts, userNodes, nat64, connLimit, userPanelUrl, customName } = body;
             if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
             const newId = crypto.randomUUID();
             const newUser = {
                 id: newId,
                 name: name,
+                customName: customName || null,
                 limitTotalReq: trafficLimit ? Math.floor(parseFloat(trafficLimit) * 6000) : null,
                 limitDailyReq: body.dailyLimit ? Math.floor(parseFloat(body.dailyLimit) * 6000) : null,
                 expiryMs: expiryDays ? Date.now() + parseInt(expiryDays) * 86400000 : null,
                 notes: notes || "",
                 maxConfigs: maxConfigs ? parseInt(maxConfigs) : null,
                 proxyIp: proxyIp || null,
-cleanIp: cleanIp || null,
+                cleanIp: cleanIp || null,
                 userMode: userMode || null,
                 userPorts: userPorts || null,
                 userNodes: userNodes || null,
@@ -1257,6 +1259,7 @@ cleanIp: cleanIp || null,
             const u = sysConfig.users.find(usr => usr.id === userId);
             if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
             if (body.name !== undefined) u.name = body.name;
+            if (body.customName !== undefined) u.customName = body.customName || null;
             if (body.trafficLimit !== undefined) u.limitTotalReq = body.trafficLimit ? Math.floor(parseFloat(body.trafficLimit) * 6000) : null;
             if (body.dailyLimit !== undefined) u.limitDailyReq = body.dailyLimit ? Math.floor(parseFloat(body.dailyLimit) * 6000) : null;
             if (body.expiryDays !== undefined) u.expiryMs = body.expiryDays ? Date.now() + parseInt(body.expiryDays) * 86400000 : null;
@@ -3811,7 +3814,7 @@ function getAllProfiles(targetSub = null) {
                 if (usr.lastDay === new Date().toISOString().split('T')[0] && usr.dReqs >= u.limitDailyReq) skip = true;
             }
             if(!skip) {
-                list.push({ id: u.id, name: u.name, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, proxyIpGeo: u.proxyIpGeo || null, userNodes: u.userNodes || null, nat64: u.nat64 || null, connLimit: u.connLimit || null, userPanelUrl: u.userPanelUrl || null });
+                list.push({ id: u.id, name: u.name, customName: u.customName || null, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, proxyIpGeo: u.proxyIpGeo || null, userNodes: u.userNodes || null, nat64: u.nat64 || null, connLimit: u.connLimit || null, userPanelUrl: u.userPanelUrl || null });
                 registerConfigEntry(u.id, u.id, u.proxyIp || '');
             }
         });
@@ -4017,10 +4020,11 @@ async function resolveUserProxyIpGeo(user) {
     user.proxyIpGeo = geoData || { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' };
 }
 
-function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, configIndex = 0, ipName = '') {
+function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, configIndex = 0, ipName = '', customName = null) {
     let prefix = sysConfig.namePrefix || "Core";
     let strategy = sysConfig.nameStrategy || "default";
-    let cleanName = profileName === "Default" ? "" : `-${profileName}`;
+    let displayName = customName || profileName;
+    let cleanName = profileName === "Default" ? "" : `-${displayName}`;
     let typeLab = type === "alpha" ? "V" : "T";
 
     if (strategy.includes('{') && strategy.includes('}')) {
@@ -4036,7 +4040,7 @@ function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, co
             .replace(/{CITY}/g, geoInfo.city)
             .replace(/{ISP}/g, geoInfo.isp)
             .replace(/{PROTOCOL}/g, protoLab)
-            .replace(/{USER}/g, profileName)
+            .replace(/{USER}/g, displayName)
             .replace(/{PORT}/g, port)
             .replace(/{PREFIX}/g, prefix)
             .replace(/{IP}/g, ip || '')
@@ -4049,9 +4053,9 @@ function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, co
     }
 
     if (strategy === "type-user-port") {
-        return `${type === "alpha" ? "vl" + "ess" : "tro" + "jan"}-${profileName}-${port}`;
+        return `${type === "alpha" ? "vl" + "ess" : "tro" + "jan"}-${displayName}-${port}`;
     } else if (strategy === "user-port") {
-        return `${profileName}-${port}`;
+        return `${displayName}-${port}`;
     } else if (strategy === "host-port-user") {
         return `${hostName}-${port}${cleanName}`;
     } else if (strategy === "prefix-user-port") {
@@ -4146,8 +4150,8 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
                         selectedProxyIp = pips[configIndex % pips.length];
                     }
                     let ipName = ipNameMap[ip] || '';
-                    let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
-                    let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
+                    let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
+                    let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
                     if (effectiveMode === "alpha" || effectiveMode === "both") {
                         let configUuid = generateConfigUuid(p.id, configIndex);
                         registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
@@ -4164,8 +4168,8 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
                     }
                     if (sysConfig.enableDirectConfigs && pips.length > 0) {
                         configIndex++;
-                        let dvName = getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName);
-                        let dtName = getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName);
+                        let dvName = getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName, p.customName);
+                        let dtName = getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName, p.customName);
                         if (effectiveMode === "alpha" || effectiveMode === "both") {
                             let configUuid = generateConfigUuid(p.id, configIndex);
                             registerConfigEntry(configUuid, p.id, '');
@@ -4247,7 +4251,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                     }
                     let ipName = ipNameMap[ip] || '';
                     if (effectiveMode === "alpha" || effectiveMode === "both") {
-                        let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
+                        let vName = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
                         vName = getUniqueName(vName);
                         proxyNames.push(`"${vName}"`);
                         let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
@@ -4258,7 +4262,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                         proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                     }
                     if (effectiveMode === "beta" || effectiveMode === "both") {
-                        let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
+                        let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
                         tName = getUniqueName(tName);
                         proxyNames.push(`"${tName}"`);
                         let randomJunkTr = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
@@ -4270,7 +4274,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                     if (sysConfig.enableDirectConfigs && pips.length > 0) {
                         let dcIndex = configIndex;
                         if (effectiveMode === "alpha" || effectiveMode === "both") {
-                            let dvName = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, dcIndex, ipName));
+                            let dvName = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, dcIndex, ipName, p.customName));
                             proxyNames.push(`"${dvName}"`);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
@@ -4280,7 +4284,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                             proxies.push(`- name: "${dvName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                         }
                         if (effectiveMode === "beta" || effectiveMode === "both") {
-                            let dtName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, dcIndex, ipName));
+                            let dtName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, dcIndex, ipName, p.customName));
                             proxyNames.push(`"${dtName}"`);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
@@ -4382,6 +4386,40 @@ ${allProxies}
 ${bestPingProxies}
 
 rules:
+  # Ad blocking rules
+  - DOMAIN-SUFFIX,doubleclick.net,REJECT
+  - DOMAIN-SUFFIX,googlesyndication.com,REJECT
+  - DOMAIN-SUFFIX,googleadservices.com,REJECT
+  - DOMAIN-SUFFIX,google-analytics.com,REJECT
+  - DOMAIN-SUFFIX,googletagmanager.com,REJECT
+  - DOMAIN-SUFFIX,ads.youtube.com,REJECT
+  - DOMAIN-SUFFIX,ads.facebook.com,REJECT
+  - DOMAIN-SUFFIX,analytics.facebook.com,REJECT
+  - DOMAIN-SUFFIX,ads.tiktok.com,REJECT
+  - DOMAIN-SUFFIX,analytics.tiktok.com,REJECT
+  - DOMAIN-SUFFIX,ads.twitter.com,REJECT
+  - DOMAIN-SUFFIX,analytics.twitter.com,REJECT
+  - DOMAIN-SUFFIX,ads.linkedin.com,REJECT
+  - DOMAIN-SUFFIX,adnxs.com,REJECT
+  - DOMAIN-SUFFIX,adsrvr.org,REJECT
+  - DOMAIN-SUFFIX,casalemedia.com,REJECT
+  - DOMAIN-SUFFIX,demdex.net,REJECT
+  - DOMAIN-SUFFIX,doubleclick.net,REJECT
+  - DOMAIN-SUFFIX,everesttech.net,REJECT
+  - DOMAIN-SUFFIX,mathtag.com,REJECT
+  - DOMAIN-SUFFIX,quantserve.com,REJECT
+  - DOMAIN-SUFFIX,scorecardresearch.com,REJECT
+  - DOMAIN-SUFFIX,taboola.com,REJECT
+  - DOMAIN-SUFFIX,outbrain.com,REJECT
+  - DOMAIN-SUFFIX,criteo.com,REJECT
+  - DOMAIN-SUFFIX,criteo.net,REJECT
+  - DOMAIN-SUFFIX,pubmatic.com,REJECT
+  - DOMAIN-SUFFIX,rubiconproject.com,REJECT
+  - DOMAIN-SUFFIX,openx.com,REJECT
+  - DOMAIN-SUFFIX,moat.com,REJECT
+  - DOMAIN-SUFFIX,moatads.com,REJECT
+  - DOMAIN-SUFFIX,adsafeprotected.com,REJECT
+  # Iran bypass rules
   - DOMAIN-SUFFIX,ir,DIRECT
   - DOMAIN-KEYWORD,gov.ir,DIRECT
   - DOMAIN-SUFFIX,fa,DIRECT
@@ -4473,7 +4511,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                     let ipName = ipNameMap[ip] || '';
 
                     if (isVless) {
-                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
+                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
                         
@@ -4519,7 +4557,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                     }
 
                     if (isTrojan) {
-                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
+                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
@@ -4566,7 +4604,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                     configIndex++;
                     if (sysConfig.enableDirectConfigs && pips.length > 0) {
                         if (isVless) {
-                            let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName));
+                            let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName, p.customName));
                             dynamicTags.push(tagStr);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
@@ -4578,7 +4616,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                             proxiesArr.push(ob);
                         }
                         if (isTrojan) {
-                            let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
+                            let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName, p.customName));
                             dynamicTags.push(tagStr);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
@@ -4795,7 +4833,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                     let ipName = ipNameMap[ip] || '';
 
                     if (isVless) {
-                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
+                        let tagStr = getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
@@ -4839,7 +4877,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                     }
 
                     if (isTrojan) {
-                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName);
+                        let tagStr = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
                         tagStr = getUniqueName(tagStr);
                         dynamicTags.push(tagStr);
 
@@ -4883,7 +4921,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                     configIndex++;
                     if (sysConfig.enableDirectConfigs && pips.length > 0) {
                         if (isVless) {
-                            let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName));
+                            let tagStr = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, configIndex, ipName, p.customName));
                             dynamicTags.push(tagStr);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
@@ -4894,7 +4932,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                             outboundsArr.push(ob);
                         }
                         if (isTrojan) {
-                            let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName));
+                            let tagStr = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, configIndex, ipName, p.customName));
                             dynamicTags.push(tagStr);
                             let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadTr = { junk: randomJunk, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
@@ -5562,7 +5600,7 @@ function getDashboardUI(hasDB) {
                   <div class="space-y-6 fade-in">
 
                       <!-- Update Banner -->
-                      <div id="update-alert-banner" class="hidden items-center justify-between p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/5" style="display:none">
+                      <div id="update-alert-banner" class="hidden items-center justify-between p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/5">
                           <div class="flex-1 min-w-0">
                               <p id="update-alert-text" class="text-sm font-bold text-emerald-600 dark:text-emerald-400"></p>
                               <a id="update-github-link" href="#" target="_blank" class="text-[10px] text-slate-400 hover:text-slate-200 transition-colors mt-1 inline-block"></a>
@@ -6760,6 +6798,18 @@ function getDashboardUI(hasDB) {
           };
 
           const CHANGELOG_DATA = {
+              "1.2.1": {
+                  headline: { en: "Custom Config Name Fix & Update Notification Fix" },
+                  added: [],
+                  fixed: [
+                      { en: "Custom Config Name not saved on user create/update — backend was ignoring the field" },
+                      { en: "Custom Config Name not applied to subscription config names — profiles now use per-user customName" },
+                      { en: "Subscription info page now displays custom name instead of internal user name" },
+                      { en: "Update notification banner not showing — inline style was overriding Tailwind classes" }
+                  ],
+                  improved: [],
+                  notes: []
+              },
               "1.2.0": {
                   headline: { en: "DoH Server, Ad Blocking & Subscription Format Links" },
                   added: [
@@ -8617,6 +8667,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               
               banner.classList.remove('hidden');
               banner.classList.add('flex');
+              banner.style.display = 'flex';
               
               if (!window._updateData) {
                   window._updateData = { latest: CURRENT_VERSION, updateAvailable: false };
@@ -8756,6 +8807,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               if (ghLink) ghLink.href = 'https://github.com/' + repo;
               banner.classList.remove('hidden');
               banner.classList.add('flex');
+              banner.style.display = 'flex';
               
               const changelogArea = document.getElementById('update-changelog-area');
               const changelogContent = document.getElementById('update-changelog-content');
@@ -8891,7 +8943,8 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               const b = document.getElementById('update-alert-banner');
               if (b) {
                   b.classList.remove('flex');
-                  b.classList.add('hidden'); 
+                  b.classList.add('hidden');
+                  b.style.display = 'none';
               }
           }
 
