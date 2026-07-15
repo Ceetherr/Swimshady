@@ -648,7 +648,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     let syncRaw = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=a' : '?flag=a');
     let syncClash = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=clash' : '?flag=clash');
     let syncSingbox = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=singbox' : '?flag=singbox');
-    let displayName = user.customName || user.name;
+    let displayName = user.customName ? `${user.customName}-${user.name}` : user.name;
     let panelName = sysConfig.name || 'SwimShady';
 
     const html = `<!DOCTYPE html>
@@ -4023,7 +4023,7 @@ async function resolveUserProxyIpGeo(user) {
 function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, configIndex = 0, ipName = '', customName = null) {
     let prefix = sysConfig.namePrefix || "Core";
     let strategy = sysConfig.nameStrategy || "default";
-    let displayName = customName || profileName;
+    let displayName = customName ? `${customName}-${profileName}` : profileName;
     let cleanName = profileName === "Default" ? "" : `-${displayName}`;
     let typeLab = type === "alpha" ? "V" : "T";
 
@@ -4034,15 +4034,16 @@ function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, co
         let now = new Date();
         let dateStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
         let workerName = sysConfig.cfWorkerName || sysConfig.name || hostName || '';
+        let effectivePrefix = customName || prefix;
         let resName = strategy
             .replace(/{FLAG}/g, geoInfo.flag)
             .replace(/{COUNTRY}/g, geoInfo.country)
             .replace(/{CITY}/g, geoInfo.city)
             .replace(/{ISP}/g, geoInfo.isp)
             .replace(/{PROTOCOL}/g, protoLab)
-            .replace(/{USER}/g, displayName)
+            .replace(/{USER}/g, profileName)
             .replace(/{PORT}/g, port)
-            .replace(/{PREFIX}/g, prefix)
+            .replace(/{PREFIX}/g, effectivePrefix)
             .replace(/{IP}/g, ip || '')
             .replace(/{IP_NAME}/g, ipName || '')
             .replace(/{HOST}/g, hostName || '')
@@ -4059,6 +4060,7 @@ function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, co
     } else if (strategy === "host-port-user") {
         return `${hostName}-${port}${cleanName}`;
     } else if (strategy === "prefix-user-port") {
+        if (customName) return `${displayName}-${port}`;
         return `${prefix}${cleanName}-${port}`;
     }
     else if (strategy === "ip") {
@@ -4066,6 +4068,7 @@ function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, co
     }
 
     else { // "default"
+        if (customName) return `${typeLab}-${displayName}-${port}`;
         return `${typeLab}-Core-${port}${cleanName}`;
     }
 }
@@ -6025,7 +6028,9 @@ function getDashboardUI(hasDB) {
                                               <label class="block text-sm font-bold text-slate-600 dark:text-slate-300" data-i18n="lbl_strategy">Configuration Name Strategy</label>
                                               <input type="text" id="cfg-name-strategy" placeholder="{FLAG} {PROTOCOL}-{USER}-{PORT}" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none">
                                               <p data-i18n="html_desc_strategy" class="text-[11px] text-slate-400 dark:text-slate-500 mt-1 leading-relaxed">
-                                                  Supported templates: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">default</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">type-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">host-port-user</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">prefix-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">ip</code>. Tags: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{FLAG}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{IP_NAME}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{USER}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{PORT}</code>
+                                                  Supported placeholders: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{FLAG}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{COUNTRY}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{CITY}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{ISP}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{PROTOCOL}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{USER}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{PORT}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{PREFIX}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{IP}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{IP_NAME}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{HOST}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{DATE}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{INDEX}</code> <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">{WORKER}</code>.<br>
+                                                  <span class="text-slate-500 dark:text-slate-400">{FLAG}</span>: Country flag emoji &middot; <span class="text-slate-500 dark:text-slate-400">{COUNTRY}</span>: Country name &middot; <span class="text-slate-500 dark:text-slate-400">{CITY}</span>: City name &middot; <span class="text-slate-500 dark:text-slate-400">{ISP}</span>: ISP / ASN org &middot; <span class="text-slate-500 dark:text-slate-400">{PROTOCOL}</span>: VLESS / Trojan &middot; <span class="text-slate-500 dark:text-slate-400">{USER}</span>: Subscriber name &middot; <span class="text-slate-500 dark:text-slate-400">{PORT}</span>: Active port &middot; <span class="text-slate-500 dark:text-slate-400">{PREFIX}</span>: Custom prefix &middot; <span class="text-slate-500 dark:text-slate-400">{IP}</span>: Clean IP &middot; <span class="text-slate-500 dark:text-slate-400">{HOST}</span>: Hostname &middot; <span class="text-slate-500 dark:text-slate-400">{DATE}</span>: Current date (YYYY-MM-DD) &middot; <span class="text-slate-500 dark:text-slate-400">{INDEX}</span>: Config index &middot; <span class="text-slate-500 dark:text-slate-400">{WORKER}</span>: Worker name.<br>
+                                                  Pre-defined strategies: <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">default</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">type-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">host-port-user</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">prefix-user-port</code>, <code class="bg-slate-100 dark:bg-slate-800/80 px-1 py-0.5 rounded text-rose-500 font-mono">ip</code>
                                               </p>
                                           </div>
                                           <div class="space-y-1">
