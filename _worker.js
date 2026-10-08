@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "1.2.1";
+const CURRENT_VERSION = "1.3.0";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -68,6 +68,7 @@ const SYSTEM_DEFAULTS = {
     enableDirectConfigs: false,
     autoUpdate: false,
     autoUpdateFormat: "normal",
+    autoPruneRelays: true,
     fakeConfigs: [
         { name: "📊 {usage}", enabled: true },
         { name: "📅 {expiry}", enabled: true }
@@ -84,22 +85,89 @@ let configRegistry = new Map();
 
 let sysUsageCache = { users: {} };
 let lastSysUsageSync = 0;
+let sysUsageDirty = false;
+let sysUsageRev = 0;
 
 const CACHE_TTL_CONFIG = 10000;
 const CACHE_TTL_USAGE = 10000;
 const CACHE_TTL_BACKUP_IP = 30000;
 let sysConfigCacheTime = 0;
 let sysUsageCacheTime = 0;
+let lastUsageEpoch = -1;
+let uuidUsageCacheTime = 0;
 let backupIpCache = null;
 let backupIpCacheTime = 0;
+
+const RELAY_Q = new Map();
+const RELAY_QUARANTINE_MS = 15 * 60 * 1000;
+const RELAY_FAIL_STREAK = 5;
+const RELAY_TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
+const PROBE_INTERVAL_MS = 10 * 60 * 1000;
+const PROBE_MAX_PER_ROUND = 6;
+const RELAY_OPEN_TIMEOUT_MS = 5000;
+const RELAY_FAILOVER_MAX_ATTEMPTS = 10;
+const RELAY_PROBE_TIMEOUT_MS = 4000;
+const RELAY_PROBE_RETRY_TIMEOUT_MS = 7000;
+const RELAY_PROBE_SKIP_MS = 600000;
+const RELAY_HEALTH_MAX_CHARS = 8000;
+const PROBE_FAIL_LIMIT = 3;
+const GRAVE_INTERVAL_MS = 30 * 60 * 1000;
+const GRAVE_MAX_PER_ROUND = 3;
+const GRAVE_HEALTHY_NEED = 3;
+const FLAP_WINDOW_MS = 24 * 60 * 60 * 1000;
+const FLAP_LIMIT = 3;
+const GRAVE_MAX_ENTRIES = 50;
+const GRAVE_MAX_CHARS = 200000;
+let lastRelaySweep = 0;
+let lastProbeTs = 0;
+let lastGraveTs = 0;
+let lastHealthSave = 0;
+let probeCursor = 0;
+let graveCursor = 0;
+let relaySnapshotLoaded = false;
+let lastResurrectChanged = false;
+
+function withTimeout(promise, ms, label) {
+    let timer = null;
+    const gate = new Promise((_, rej) => {
+        timer = setTimeout(() => {
+            try { rej(new Error(label || "timeout")); } catch (e) {}
+        }, ms);
+    });
+    return Promise.race([promise, gate]).finally(() => {
+        try { if (timer) clearTimeout(timer); } catch (e) {}
+    });
+}
+
+async function fetchT(url, init = {}, timeoutMs = 10000) {
+    const timeout = Math.max(1, Number(timeoutMs) || 10000);
+    const controller = new AbortController();
+    const callerSignal = init && init.signal ? init.signal : null;
+    let onCallerAbort = null;
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+        if (callerSignal) {
+            if (callerSignal.aborted) controller.abort();
+            else {
+                onCallerAbort = () => controller.abort();
+                callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+            }
+        }
+        return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+        if (callerSignal && onCallerAbort) callerSignal.removeEventListener("abort", onCallerAbort);
+    }
+}
 
 async function deployWorkerToCloudflare(accountId, apiToken, workerName, code) {
 
     let currentBindings = [];
     try {
-        const settingsRes = await fetch(
+        const settingsRes = await fetchT(
             `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}/settings`,
-            { headers: { "Authorization": `Bearer ${apiToken}` } }
+            { headers: { "Authorization": `Bearer ${apiToken}` } },
+            30000
         );
         const settingsJson = await settingsRes.json();
         if (settingsJson.success && settingsJson.result?.bindings) {
@@ -118,9 +186,10 @@ async function deployWorkerToCloudflare(accountId, apiToken, workerName, code) {
     form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
     form.append("_worker.js", new Blob([code], { type: "application/javascript+module" }), "_worker.js");
 
-    return await fetch(
+    return await fetchT(
         `https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts/${encodeURIComponent(workerName)}`,
-        { method: "PUT", headers: { "Authorization": `Bearer ${apiToken}` }, body: form }
+        { method: "PUT", headers: { "Authorization": `Bearer ${apiToken}` }, body: form },
+        30000
     );
 }
 
@@ -140,12 +209,53 @@ async function d1Put(env, key, value) {
     await d1Init(env);
     try { await env.IOT_DB.prepare("INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, value).run(); } catch(e) {}
 }
+async function d1PutStrict(env, key, value) {
+    if (!env.IOT_DB) throw new Error("d1-unavailable");
+    await d1Init(env);
+    await env.IOT_DB.prepare("INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(key, value).run();
+}
 
 async function cachedD1Put(env, key, value) {
     await d1Put(env, key, value);
     if (key === "sys_config") sysConfigCacheTime = 0;
     else if (key === "sys_usage") sysUsageCacheTime = 0;
     else if (key === "backup_ip") backupIpCacheTime = 0;
+}
+
+function pruneUuidUsage(maxAgeMs) {
+    const cutoff = Date.now() - maxAgeMs;
+    for (let [k, v] of uuidUsage.entries()) {
+        if ((activeConns.get(k) || 0) > 0) continue;
+        if (!v || (v.last || 0) < cutoff) uuidUsage.delete(k);
+    }
+}
+
+function persistUuidUsage(env, ctx) {
+    pruneUuidUsage(30 * 86400000);
+    ctx?.waitUntil((async () => {
+        try {
+            const stored = await d1Get(env, "uuid_usage");
+            if (stored) {
+                const parsed = JSON.parse(stored);
+                for (let [k, v] of Object.entries(parsed)) {
+                    if ((activeConns.get(k) || 0) > 0) continue;
+                    const local = uuidUsage.get(k);
+                    if (!local || (v.last || 0) >= (local.last || 0)) uuidUsage.set(k, v);
+                }
+            }
+        } catch (e) {}
+        let obj = {};
+        for (let [k, v] of uuidUsage.entries()) obj[k] = v;
+        await cachedD1Put(env, "uuid_usage", JSON.stringify(obj)).catch(() => {});
+    })());
+}
+
+function persistUsage(env) {
+    const snapRev = sysUsageRev;
+    const payload = JSON.stringify(sysUsageCache);
+    return cachedD1Put(env, "sys_usage", payload).then(() => {
+        if (sysUsageRev === snapRev) sysUsageDirty = false;
+    }).catch(() => {});
 }
 
 function sha224Hex(m) {
@@ -241,25 +351,55 @@ function generateApiKey(name) {
     return { id, name: name || "Unnamed Key", key, createdAt: Date.now(), lastUsed: null };
 }
 
+const REQ_BYTES_EST = 1073741824 / 6000;
+function usageTotalBytes(u) {
+    try {
+        if (!u) return 0;
+        if (typeof u.bytes === "number" && u.bytes >= 0) return Math.floor(u.bytes);
+        return Math.floor((u.reqs || 0) * REQ_BYTES_EST);
+    } catch (e) { return 0; }
+}
+function usageDailyBytes(u, today) {
+    try {
+        if (!u) return 0;
+        const day = today || new Date().toISOString().split("T")[0];
+        if ((u.lastDay || "") !== day) return 0;
+        if (typeof u.dBytes === "number" && u.dBytes >= 0) return Math.floor(u.dBytes);
+        return Math.floor((u.dReqs || 0) * REQ_BYTES_EST);
+    } catch (e) { return 0; }
+}
+function limitReqToBytes(limitReq) {
+    try { return limitReq ? Math.floor(limitReq * REQ_BYTES_EST) : 0; }
+    catch (e) { return 0; }
+}
+
 function trackUsage(uuid, bytes, env, ctx) {
     if (!sysUsageCache) sysUsageCache = { users: {} };
     if (!sysUsageCache.users) sysUsageCache.users = {};
-    if (!sysUsageCache.users[uuid]) sysUsageCache.users[uuid] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
-    
+    if (!sysUsageCache.users[uuid]) sysUsageCache.users[uuid] = { reqs: 0, dReqs: 0, bytes: 0, dBytes: 0, lastDay: new Date().toISOString().split('T')[0] };
+
     let u = sysUsageCache.users[uuid];
     let today = new Date().toISOString().split('T')[0];
     if (u.lastDay !== today) {
         u.dReqs = 0;
+        u.dBytes = 0;
         u.lastDay = today;
     }
     if (u.reqs === undefined) u.reqs = 0;
     if (u.dReqs === undefined) u.dReqs = 0;
+    if (typeof u.bytes !== "number" || u.bytes < 0) u.bytes = Math.floor((u.reqs || 0) * REQ_BYTES_EST);
+    if (typeof u.dBytes !== "number" || u.dBytes < 0) u.dBytes = Math.floor((u.dReqs || 0) * REQ_BYTES_EST);
 
     if (bytes === 0) {
         u.reqs += 1;
         u.dReqs += 1;
+    } else if (typeof bytes === "number" && bytes > 0) {
+        u.bytes += Math.floor(bytes);
+        u.dBytes += Math.floor(bytes);
     }
-    
+    sysUsageDirty = true;
+    sysUsageRev++;
+
     const now = Date.now();
     if (now - lastSysUsageSync > 30000) {
         lastSysUsageSync = now;
@@ -273,9 +413,9 @@ function trackUsage(uuid, bytes, env, ctx) {
                         let reason = null;
                         if (u.expiryMs && Date.now() > u.expiryMs) {
                             reason = `Expiration date reached (${new Date(u.expiryMs).toLocaleDateString()})`;
-                        } else if (sysU && u.limitTotalReq && sysU.reqs >= u.limitTotalReq) {
-                            let usedGB = (sysU.reqs / 6000).toFixed(2);
-                            let limitGB = (u.limitTotalReq / 6000).toFixed(2);
+                        } else if (sysU && u.limitTotalReq && usageTotalBytes(sysU) >= limitReqToBytes(u.limitTotalReq)) {
+                            let usedGB = (usageTotalBytes(sysU) / 1073741824).toFixed(2);
+                            let limitGB = (limitReqToBytes(u.limitTotalReq) / 1073741824).toFixed(2);
                             reason = `Traffic limit exceeded (${usedGB}GB / ${limitGB}GB)`;
                         }
                         if (reason) {
@@ -287,7 +427,7 @@ function trackUsage(uuid, bytes, env, ctx) {
                             if (sysConfig.tgToken && (sysConfig.tgAdminId || sysConfig.tgChatId)) {
                                 const tgMsg = `⚠️ <b>User Auto-Disabled</b>\n\n👤 <b>User:</b> ${u.name}\n🆔 <b>ID:</b> <code>${u.id}</code>\n📝 <b>Reason:</b> ${reason}`;
                                 const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
-                                ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
+                                ctx?.waitUntil(fetchT(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
@@ -301,13 +441,9 @@ function trackUsage(uuid, bytes, env, ctx) {
             if (changedConfig) {
                 ctx?.waitUntil(cachedD1Put(env, "sys_config", JSON.stringify(sysConfig)).catch(()=>{}));
             }
-            ctx?.waitUntil(cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache)).catch(()=>{}));
+            ctx?.waitUntil(loadSysConfig(env).catch(() => {}).then(() => persistUsage(env)));
             // Persist uuidUsage to D1 so live connection data survives isolate restarts
-            let uuidUsageObj = {};
-            for(let [k,v] of uuidUsage.entries()) uuidUsageObj[k] = v;
-            if (Object.keys(uuidUsageObj).length > 0) {
-                ctx?.waitUntil(cachedD1Put(env, "uuid_usage", JSON.stringify(uuidUsageObj)).catch(()=>{}));
-            }
+            persistUuidUsage(env, ctx);
         }
     }
 }
@@ -318,6 +454,17 @@ export default {
             if (!isolateStartTime) isolateStartTime = Date.now();
             await loadSysConfig(env);
             activeDeviceId = sysConfig.deviceId || generateHardwareId(sysConfig.apiRoute);
+
+            try {
+                const nowSweep = Date.now();
+                if (nowSweep - lastRelaySweep > 60000) {
+                    lastRelaySweep = nowSweep;
+                    if (ctx && typeof ctx.waitUntil === "function") {
+                        ctx.waitUntil(probeDeadRelays(env).catch(() => {}));
+                        ctx.waitUntil(probeGraveyard(env).catch(() => {}));
+                    }
+                }
+            } catch (e) {}
 
             const url = new URL(request.url);
             const upgradeHeader = request.headers.get("Upgrade");
@@ -339,6 +486,7 @@ export default {
                 update: `/${encodeURI(sysConfig.apiRoute)}/api/update`,
                 apiKeys: `/${encodeURI(sysConfig.apiRoute)}/api/keys`,
                 doh: `/${encodeURI(sysConfig.apiRoute)}/dns-query`,
+                health: `/${encodeURI(sysConfig.apiRoute)}/api/health`,
             };
 
             const isSyncRoute = reqPath.endsWith('/api/sync');
@@ -347,7 +495,8 @@ export default {
             const isUpdateRoute = reqPath === routes.update || reqPath.endsWith('/api/update');
             const isApiKeysRoute = reqPath === routes.apiKeys || reqPath.endsWith('/api/keys');
             const isDohRoute = reqPath === routes.doh || reqPath.endsWith('/dns-query');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute || isApiKeysRoute || isDohRoute;
+            const isHealthRoute = reqPath === routes.health;
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.syncPanel || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute || isUpdateRoute || isApiKeysRoute || isDohRoute || isHealthRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -386,6 +535,9 @@ export default {
                 }
                 if (isApiKeysRoute) {
                     return await handleApiKeys(request, env, ctx);
+                }
+                if (isHealthRoute) {
+                    return await handleHealthApi(request, env);
                 }
                 if (reqPath === routes.doh || reqPath.endsWith('/dns-query')) {
                     return await handleDoH(request, env);
@@ -459,7 +611,6 @@ export default {
                     if (isValidUser && targetUser) {
                         let idClean = targetUser.id.replace(/-/g, '').toLowerCase();
                         let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0 };
-                        let totalReqs = sysU.reqs || 0;
                         let limitTotal = 0;
                         let expiryMs = 0;
                         if (hasMultiUser) {
@@ -470,15 +621,15 @@ export default {
                             expiryMs = sysConfig.expiryMs || 0;
                         }
                         
-                        let usedBytes = Math.floor(totalReqs * (1073741824 / 6000));
-                        let limitBytes = Math.floor(limitTotal * (1073741824 / 6000));
+                        let usedBytes = usageTotalBytes(sysU);
+                        let limitBytes = limitReqToBytes(limitTotal);
                         let expireSec = expiryMs ? Math.floor(expiryMs / 1000) : 0;
                         
                         const subUserInfo = `upload=0; download=${usedBytes}; total=${limitBytes}; expire=${expireSec}`;
                         resHeaders.set("Subscription-UserInfo", subUserInfo);
                         resHeaders.set("subscription-userinfo", subUserInfo);
-                        resHeaders.set("Profile-Update-Interval", "12");
-                        resHeaders.set("profile-update-interval", "12");
+                        resHeaders.set("Profile-Update-Interval", "1");
+                        resHeaders.set("profile-update-interval", "1");
                         
                         let cleanName = encodeURIComponent(targetUser.name);
                         resHeaders.set("Content-Disposition", `attachment; filename="${cleanName}"; filename*=UTF-8''${cleanName}`);
@@ -488,12 +639,15 @@ export default {
                     let isClashYaml = false;
                     let isSingboxJson = false;
                     let isClashJson = false;
+                    let isV2rayJson = false;
 
                     // If flag is explicitly set, we respect it
                     if (flag === "clash" || flag === "yaml" || flag === "meta" || flag === "stash" || flag === "clash-meta" || flag === "y") {
                         isClashYaml = true;
                     } else if (flag === "b" || flag === "c_legacy") {
                         isClashJson = true;
+                    } else if (flag === "vjson" || flag === "v") {
+                        isV2rayJson = true;
                     } else if (flag === "sing" || flag === "singbox" || flag === "sing-box" || flag === "sb" || flag === "s" || flag === "c" || flag === "g") {
                         isSingboxJson = true;
                     } else if (flag === "a" || flag === "raw" || flag === "") {
@@ -518,6 +672,11 @@ export default {
                     } else if (isClashJson) {
                         resHeaders.set("Content-Type", "application/json; charset=utf-8");
                         return new Response(JSON.stringify(await buildClashJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
+                            headers: resHeaders
+                        });
+                    } else if (isV2rayJson) {
+                        resHeaders.set("Content-Type", "application/json; charset=utf-8");
+                        return new Response(JSON.stringify(await buildVJsonProfile(clientHost, targetSub, allowInsecure), null, 2), {
                             headers: resHeaders
                         });
                     } else {
@@ -581,7 +740,7 @@ async function serveMaintenancePage(request, url) {
         cleanHeaders.delete("x-forwarded-for");
         const fetchInit = { method: request.method, headers: cleanHeaders, redirect: "follow" };
         if (request.method !== "GET" && request.method !== "HEAD") fetchInit.body = request.body;
-        return await fetch(new Request(targetUrl.toString(), fetchInit));
+        return await fetchT(new Request(targetUrl.toString(), fetchInit));
     } catch (e) { return new Response("Not Found", { status: 404 }); }
 }
 
@@ -589,22 +748,22 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     let idClean = user.id.replace(/-/g, '').toLowerCase();
     let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-    let totalReqs = sysU.reqs || 0;
+    let totalBytes = usageTotalBytes(sysU);
 
     let todayDate = new Date().toISOString().split('T')[0];
-    let dailyReqs = sysU.lastDay === todayDate ? (sysU.dReqs || 0) : 0;
+    let dailyBytes = usageDailyBytes(sysU, todayDate);
 
     let limitTotal = user.limitTotalReq || 0;
     let limitDaily = user.limitDailyReq || 0;
 
-    let totalGb = (totalReqs / 6000).toFixed(2);
-    let limitTotalGb = limitTotal ? (limitTotal / 6000).toFixed(2) : '9999';
+    let totalGb = (totalBytes / 1073741824).toFixed(2);
+    let limitTotalGb = limitTotal ? (limitReqToBytes(limitTotal) / 1073741824).toFixed(2) : '9999';
 
-    let dailyGb = (dailyReqs / 6000).toFixed(2);
-    let limitDailyGb = limitDaily ? (limitDaily / 6000).toFixed(2) : '9999';
+    let dailyGb = (dailyBytes / 1073741824).toFixed(2);
+    let limitDailyGb = limitDaily ? (limitReqToBytes(limitDaily) / 1073741824).toFixed(2) : '9999';
 
-    let totalPercent = limitTotal ? Math.min(100, (totalReqs / limitTotal) * 100).toFixed(1) : 0;
-    let dailyPercent = limitDaily ? Math.min(100, (dailyReqs / limitDaily) * 100).toFixed(1) : 0;
+    let totalPercent = limitTotal ? Math.min(100, (totalBytes / limitReqToBytes(limitTotal)) * 100).toFixed(1) : 0;
+    let dailyPercent = limitDaily ? Math.min(100, (dailyBytes / limitReqToBytes(limitDaily)) * 100).toFixed(1) : 0;
 
     let expiryDateTxt = '2099-01-01';
     let isExpired = false;
@@ -619,8 +778,8 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     let statusCode = 'active';
     if (user.isPaused) statusCode = 'paused';
     else if (isExpired) statusCode = 'expired';
-    else if (limitTotal && totalReqs >= limitTotal) statusCode = 'limit';
-    else if (limitDaily && dailyReqs >= limitDaily) statusCode = 'dailyLimit';
+    else if (limitTotal && totalBytes >= limitReqToBytes(limitTotal)) statusCode = 'limit';
+    else if (limitDaily && dailyBytes >= limitReqToBytes(limitDaily)) statusCode = 'dailyLimit';
 
     let cleanUrl = new URL(url.href);
     let panelUrlToUse = sysConfig.customPanelUrl;
@@ -648,6 +807,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     let syncRaw = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=a' : '?flag=a');
     let syncClash = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=clash' : '?flag=clash');
     let syncSingbox = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=singbox' : '?flag=singbox');
+    let syncVjson = cleanUrl.href + (cleanUrl.href.includes('?') ? '&flag=vjson' : '?flag=vjson');
     let displayName = user.customName ? `${user.customName}-${user.name}` : user.name;
     let panelName = sysConfig.name || 'SwimShady';
 
@@ -873,6 +1033,18 @@ function serveSubscriptionInfoPage(user, host, url, request) {
                     </div>
                 </div>
 
+                <!-- v2rayN / Xray JSON -->
+                <div class="mb-4">
+                    <div class="flex items-center gap-2 mb-2">
+                        <span class="text-[10px] font-bold px-2 py-0.5" style="background: var(--accent-dim); color: var(--accent); border: 1px solid var(--green-border);">V2RAYN</span>
+                        <span class="text-[10px] text-muted">v2rayN, v2rayNG, Hiddify (Xray JSON)</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <input type="text" id="sub-vjson" readonly value="${syncVjson}" class="input-field flex-1 px-3 py-2 text-[11px] font-mono truncate outline-none" style="color: var(--text-2);">
+                        <button onclick="copyLink('sub-vjson')" class="btn-primary px-3 py-2 text-[10px] font-bold">Copy</button>
+                    </div>
+                </div>
+
                 <!-- Raw / Base64 -->
                 <div>
                     <div class="flex items-center gap-2 mb-2">
@@ -959,7 +1131,7 @@ function serveSubscriptionInfoPage(user, host, url, request) {
     <\/script>
 </body>
 </html>`;
-    return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
 let sysConfigLoading = null;
@@ -982,7 +1154,15 @@ async function loadSysConfig(env) {
             }
             await sysConfigLoading;
         }
-        if (now - sysUsageCacheTime > CACHE_TTL_USAGE) {
+        let curUsageEpoch = (sysConfig.usageEpoch && sysConfig.usageEpoch.t) || 0;
+        if (curUsageEpoch !== lastUsageEpoch) {
+            if (lastUsageEpoch !== -1) {
+                sysUsageDirty = false;
+                sysUsageCacheTime = 0;
+            }
+            lastUsageEpoch = curUsageEpoch;
+        }
+        if (now - sysUsageCacheTime > CACHE_TTL_USAGE && !sysUsageDirty) {
             if (!sysUsageLoading) {
                 sysUsageLoading = d1Get(env, "sys_usage").then(ustored => {
                     if (ustored) sysUsageCache = JSON.parse(ustored);
@@ -995,17 +1175,34 @@ async function loadSysConfig(env) {
             }
             await sysUsageLoading;
         }
-        // Load uuidUsage from D1 to restore live connection data after isolate restart
-        if (uuidUsage.size === 0) {
+        if (now - uuidUsageCacheTime > CACHE_TTL_USAGE) {
+            uuidUsageCacheTime = now;
             try {
                 const uuidStored = await d1Get(env, "uuid_usage");
                 if (uuidStored) {
                     const parsed = JSON.parse(uuidStored);
                     for (let [k, v] of Object.entries(parsed)) {
+                        const local = uuidUsage.get(k);
+                        if (local && (activeConns.get(k) || 0) > 0) continue;
                         uuidUsage.set(k, v);
                     }
+                    pruneUuidUsage(30 * 86400000);
                 }
             } catch(e) {}
+        }
+    }
+
+    let appliedEpoch = sysConfig.usageEpoch;
+    if (appliedEpoch && appliedEpoch.id && appliedEpoch.t) {
+        if (!sysUsageCache) sysUsageCache = { users: {} };
+        if (!sysUsageCache.users) sysUsageCache.users = {};
+        let eu = sysUsageCache.users[appliedEpoch.id];
+        if (!eu) {
+            sysUsageCache.users[appliedEpoch.id] = { reqs: 0, dReqs: 0, bytes: 0, dBytes: 0, lastDay: new Date().toISOString().split('T')[0], resetAt: appliedEpoch.t };
+        } else if ((eu.resetAt || 0) < appliedEpoch.t) {
+            eu.reqs = 0; eu.dReqs = 0; eu.bytes = 0; eu.dBytes = 0; eu.resetAt = appliedEpoch.t;
+            sysUsageDirty = true;
+            sysUsageRev++;
         }
     }
 
@@ -1032,14 +1229,14 @@ async function fetchCloudflareUsage(accountId, apiToken) {
         const query = `query GetDailyUsage($accountId: String!, $start: ISO8601DateTime!) { viewer { accounts(filter: {accountTag: $accountId}) { workersInvocationsAdaptive(limit: 1, filter: { datetime_geq: $start }) { sum { requests } } } } }`;
         const variables = { accountId: accountId, start: currentDate };
         
-        const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+        const res = await fetchT("https://api.cloudflare.com/client/v4/graphql", {
             method: "POST",
             headers: {
                 "Authorization": `Bearer ${apiToken}`,
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({ query, variables })
-        });
+        }, 30000);
         
         const json = await res.json();
         const reqs = json?.data?.viewer?.accounts?.[0]?.workersInvocationsAdaptive?.[0]?.sum?.requests;
@@ -1117,7 +1314,7 @@ async function sendTelegramMessage(request, type, hostName) {
     const tgUrl = `https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`;
     const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
     try {
-        await fetch(tgUrl, {
+        await fetchT(tgUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1190,14 +1387,14 @@ async function handleUsersApi(request, env, ctx) {
             const enriched = users.map(u => {
                 const idClean = u.id.replace(/-/g, '').toLowerCase();
                 const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-                const usedBytes = Math.floor((sysU.reqs || 0) * (1073741824 / 6000));
-                const limitBytes = u.limitTotalReq ? Math.floor(u.limitTotalReq * (1073741824 / 6000)) : 0;
+                const usedBytes = usageTotalBytes(sysU);
+                const limitBytes = limitReqToBytes(u.limitTotalReq);
                 const isExpired = u.expiryMs && Date.now() > u.expiryMs;
                 let status = "active";
                 if (u.isPaused && u.disabledReason) status = "auto-disabled";
                 else if (u.isPaused) status = "paused";
                 else if (isExpired) status = "expired";
-                return { ...u, usage: { total: usedBytes, limit: limitBytes, daily: sysU.dReqs || 0, dailyLimit: u.limitDailyReq || 0 }, status };
+                return { ...u, usage: { total: usedBytes, limit: limitBytes, daily: usageDailyBytes(sysU), dailyLimit: limitReqToBytes(u.limitDailyReq) }, status };
             });
             return new Response(JSON.stringify({ success: true, users: enriched, total: enriched.length }), { headers: { "Content-Type": "application/json" } });
         }
@@ -1207,8 +1404,8 @@ async function handleUsersApi(request, env, ctx) {
             if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
             const idClean = u.id.replace(/-/g, '').toLowerCase();
             const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-            const usedBytes = Math.floor((sysU.reqs || 0) * (1073741824 / 6000));
-            const limitBytes = u.limitTotalReq ? Math.floor(u.limitTotalReq * (1073741824 / 6000)) : 0;
+            const usedBytes = usageTotalBytes(sysU);
+            const limitBytes = limitReqToBytes(u.limitTotalReq);
             const isExpired = u.expiryMs && Date.now() > u.expiryMs;
             let status = "active";
             if (u.isPaused && u.disabledReason) status = "auto-disabled";
@@ -1216,12 +1413,12 @@ async function handleUsersApi(request, env, ctx) {
             else if (isExpired) status = "expired";
             const hostName = new URL(request.url).hostname;
             const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
-            return new Response(JSON.stringify({ success: true, user: { ...u, usage: { total: usedBytes, limit: limitBytes, daily: sysU.dReqs || 0, dailyLimit: u.limitDailyReq || 0 }, status, subscriptionUrl: subUrl } }), { headers: { "Content-Type": "application/json" } });
+            return new Response(JSON.stringify({ success: true, user: { ...u, usage: { total: usedBytes, limit: limitBytes, daily: usageDailyBytes(sysU), dailyLimit: limitReqToBytes(u.limitDailyReq) }, status, subscriptionUrl: subUrl } }), { headers: { "Content-Type": "application/json" } });
         }
 
         if (method === "POST" && !userId) {
             const body = await request.json();
-            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts, userNodes, nat64, connLimit, userPanelUrl, customName } = body;
+            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, cleanIp, userMode, userPorts, userNodes, nat64, connLimit, userPanelUrl, customName, segMode, segPackets, segLengths, segDelays, segMaxSplit, segManual, tlsMask } = body;
             if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
             const newId = crypto.randomUUID();
             const newUser = {
@@ -1241,6 +1438,13 @@ async function handleUsersApi(request, env, ctx) {
                 nat64: nat64 || null,
                 connLimit: connLimit ? parseInt(connLimit) : null,
                 userPanelUrl: userPanelUrl || null,
+                segMode: segMode || null,
+                segPackets: segPackets || null,
+                segLengths: segLengths || null,
+                segDelays: segDelays || null,
+                segMaxSplit: segMaxSplit || null,
+                segManual: segManual || null,
+                tlsMask: tlsMask || null,
                 createdAt: Date.now()
             };
             await resolveUserProxyIpGeo(newUser);
@@ -1273,6 +1477,13 @@ async function handleUsersApi(request, env, ctx) {
             if (body.nat64 !== undefined) u.nat64 = body.nat64;
             if (body.connLimit !== undefined) u.connLimit = body.connLimit ? parseInt(body.connLimit) : null;
             if (body.userPanelUrl !== undefined) u.userPanelUrl = body.userPanelUrl || null;
+            if (body.segMode !== undefined) u.segMode = body.segMode || null;
+            if (body.segPackets !== undefined) u.segPackets = body.segPackets || null;
+            if (body.segLengths !== undefined) u.segLengths = body.segLengths || null;
+            if (body.segDelays !== undefined) u.segDelays = body.segDelays || null;
+            if (body.segMaxSplit !== undefined) u.segMaxSplit = body.segMaxSplit || null;
+            if (body.segManual !== undefined) u.segManual = body.segManual || null;
+            if (body.tlsMask !== undefined) u.tlsMask = body.tlsMask || null;
             if (body.status !== undefined) {
                 if (body.status === "active") { u.isPaused = false; u.disabledReason = null; u.disabledAt = null; }
                 else if (body.status === "paused") { u.isPaused = true; u.disabledReason = null; u.disabledAt = null; }
@@ -1310,10 +1521,22 @@ async function handleUsersApi(request, env, ctx) {
             if (sysUsageCache.users[uuidClean]) {
                 sysUsageCache.users[uuidClean].reqs = 0;
                 sysUsageCache.users[uuidClean].dReqs = 0;
+                sysUsageCache.users[uuidClean].bytes = 0;
+                sysUsageCache.users[uuidClean].dBytes = 0;
             } else {
-                sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+                sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, bytes: 0, dBytes: 0, lastDay: new Date().toISOString().split('T')[0] };
             }
-            await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            const resetAt = Date.now();
+            if (uuidUsage.has(uuidClean)) { uuidUsage.get(uuidClean).bytes = 0; uuidUsage.get(uuidClean).last = resetAt; }
+            let ru = sysUsageCache.users[uuidClean];
+            if (ru) ru.resetAt = resetAt;
+            sysUsageDirty = true;
+            sysUsageRev++;
+            await persistUsage(env);
+            sysConfig.usageEpoch = { t: resetAt, id: uuidClean };
+            lastUsageEpoch = resetAt;
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            persistUuidUsage(env, ctx);
             ctx?.waitUntil(logActivity(env, "Traffic Reset", `Traffic reset for user ${userId} via API`).catch(()=>{}));
             return new Response(JSON.stringify({ success: true, message: "Traffic reset" }), { headers: { "Content-Type": "application/json" } });
         }
@@ -1340,12 +1563,16 @@ async function handleStatsApi(request, env) {
 
         let totalTrafficReqs = 0;
         let dailyTrafficReqs = 0;
+        let totalTrafficBytes = 0;
+        let dailyTrafficBytes = 0;
         const todayDate = new Date().toISOString().split('T')[0];
         users.forEach(u => {
             const idClean = u.id.replace(/-/g, '').toLowerCase();
             const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
             totalTrafficReqs += (sysU.reqs || 0);
             if (sysU.lastDay === todayDate) dailyTrafficReqs += (sysU.dReqs || 0);
+            totalTrafficBytes += usageTotalBytes(sysU);
+            dailyTrafficBytes += usageDailyBytes(sysU, todayDate);
         });
 
         const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
@@ -1354,15 +1581,65 @@ async function handleStatsApi(request, env) {
             success: true,
             stats: {
                 users: { total: totalUsers, active: activeUsers, paused: pausedUsers, expired: expiredUsers, autoDisabled: autoDisabledUsers },
-                traffic: { totalRequests: totalTrafficReqs, totalGB: (totalTrafficReqs / 6000).toFixed(2), dailyRequests: dailyTrafficReqs, dailyGB: (dailyTrafficReqs / 6000).toFixed(2) },
+                traffic: { totalRequests: totalTrafficReqs, totalGB: (totalTrafficBytes / 1073741824).toFixed(2), dailyRequests: dailyTrafficReqs, dailyGB: (dailyTrafficBytes / 1073741824).toFixed(2) },
                 system: { uptimeSeconds: upSeconds, activeConnections, version: CURRENT_VERSION, isPaused: sysConfig.isPaused || false }
             }
         }), { headers: { "Content-Type": "application/json" } });
     } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
 }
 
+async function handleHealthApi(request, env) {
+    const headers = { "Content-Type": "application/json", "Cache-Control": "no-store" };
+    if (request.method !== "GET" && request.method !== "HEAD") {
+        return new Response(JSON.stringify({ ok: false, error: "405" }), { status: 405, headers });
+    }
+    try {
+        const url = new URL(request.url);
+        const authHeader = request.headers.get("Authorization") || "";
+        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
+        const isAuthed = authKey === sysConfig.masterKey || isPanelApiKey(authKey);
+
+        let d1 = false;
+        try {
+            if (env && env.IOT_DB) {
+                const row = await env.IOT_DB.prepare("SELECT 1 AS ok").first();
+                d1 = !!(row && row.ok === 1);
+            }
+        } catch (e) { d1 = false; }
+
+        const now = Date.now();
+        let activeClients = 0;
+        for (let v of activeConns.values()) if (v > 0) activeClients++;
+
+        const out = {
+            ok: d1,
+            version: CURRENT_VERSION,
+            colo: (request.cf && request.cf.colo) || "Unknown",
+            uptimeSeconds: Math.floor((now - isolateStartTime) / 1000),
+            activeConnections,
+            activeClients,
+            config: { cachedAt: sysConfigCacheTime, ageMs: sysConfigCacheTime ? now - sysConfigCacheTime : -1, ttlMs: CACHE_TTL_CONFIG },
+            usage: { cachedAt: sysUsageCacheTime, ageMs: sysUsageCacheTime ? now - sysUsageCacheTime : -1, ttlMs: CACHE_TTL_USAGE, rev: sysUsageRev, dirty: sysUsageDirty },
+            d1
+        };
+        await loadRelayHealthSnapshot(env);
+        const relays = await relayHealthSnapshotAsync(env);
+        out.relays = { total: collectRelayInventory().length, quarantined: relays.quarantined.length, graveyard: relays.graveyard.length };
+        if (isAuthed) {
+            const per = {};
+            for (let [k, v] of activeConns.entries()) if (v > 0) per[k] = v;
+            out.activeConns = per;
+            out.relays.quarantinedKeys = relays.quarantined;
+            out.relays.graveyardEntries = relays.graveyard;
+        }
+        return new Response(JSON.stringify(out), { headers });
+    } catch (e) {
+        return new Response(JSON.stringify({ ok: false, version: CURRENT_VERSION, error: "unavailable" }), { status: 500, headers });
+    }
+}
+
 function cmpVersions(a, b) {
-    const strip = v => String(v).replace(/^v/, '').trim();
+    const strip = v => String(v).replace(/^v/, '').trim().split('-')[0];
     const pa = strip(a).split('.').map(Number);
     const pb = strip(b).split('.').map(Number);
     for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
@@ -1389,7 +1666,7 @@ async function handleUpdateApi(request, env, ctx) {
         if (data.action === "check") {
             let remoteVer = null;
             try {
-                const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/version`);
+                const res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/version`);
                 if (res.ok) {
                     const txt = (await res.text()).trim();
                     if (txt && txt.length <= 15) remoteVer = txt;
@@ -1397,7 +1674,7 @@ async function handleUpdateApi(request, env, ctx) {
             } catch(e) {}
             if (!remoteVer) {
                 try {
-                    const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
+                    const res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
                     if (res.ok) {
                         const code = await res.text();
                         const match = code.match(/const\s+CURRENT_VERSION\s*=\s*["']([^"']+)["']/);
@@ -1424,7 +1701,7 @@ async function handleUpdateApi(request, env, ctx) {
             let finalCodeToDeploy = data.code;
             if (!finalCodeToDeploy) {
                 try {
-                    const res = await fetch(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
+                    const res = await fetchT(`https://raw.githubusercontent.com/${repo}/main/_worker.js`);
                     if (!res.ok) throw new Error(`HTTP ${res.status}`);
                     finalCodeToDeploy = await res.text();
                 } catch(e) {
@@ -1447,7 +1724,7 @@ async function handleUpdateApi(request, env, ctx) {
                 if (sysConfig.tgToken && (sysConfig.tgAdminId || sysConfig.tgChatId)) {
                     const tgMsg = `🔄 <b>Panel Updated</b>\n\n📦 v${CURRENT_VERSION} → v${newVersion}`;
                     const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
-                    ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
+                    ctx?.waitUntil(fetchT(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
                     }).catch(()=>{}));
@@ -1525,7 +1802,7 @@ async function handleDoH(request, env) {
                 dohUrl.searchParams.set('name', dnsName);
                 dohUrl.searchParams.set('type', dnsType);
                 
-                const res = await fetch(dohUrl.toString(), { headers: { 'accept': 'application/dns-json' } });
+                const res = await fetchT(dohUrl.toString(), { headers: { 'accept': 'application/dns-json' } });
                 const data = await res.json();
                 
                 return new Response(JSON.stringify(data), {
@@ -1545,7 +1822,7 @@ async function handleDoH(request, env) {
             if (contentType.includes('application/dns-message')) {
                 // Wire format - forward to upstream
                 const body = await request.arrayBuffer();
-                const res = await fetch(upstreamDns, {
+                const res = await fetchT(upstreamDns, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/dns-message', 'accept': 'application/dns-message' },
                     body: body
@@ -1558,7 +1835,7 @@ async function handleDoH(request, env) {
                 // JSON format
                 const body = await request.json();
                 const dohUrl = new URL(upstreamDns);
-                const res = await fetch(dohUrl.toString(), {
+                const res = await fetchT(dohUrl.toString(), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/dns-json', 'accept': 'application/dns-json' },
                     body: JSON.stringify(body)
@@ -1678,7 +1955,7 @@ async function handleAuth(request, hostName, ctx, env) {
                         tgAdminId: sysConfig.tgAdminId,
                         ts: Date.now()
                     };
-                    ctx?.waitUntil(fetch(`${hubUrl}/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`, {
+                    ctx?.waitUntil(fetchT(`${hubUrl}/${encodeURI(sysConfig.apiRoute)}/tg/sync_panel`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(signalPayload)
@@ -1692,7 +1969,7 @@ async function handleAuth(request, hostName, ctx, env) {
                 loc: (request.cf?.city || "Unknown") + ", " + (request.cf?.country || "Unknown")
             };
             let usageData = {};
-            for(let [k,v] of uuidUsage.entries()) usageData[k] = v;
+            for(let [k,v] of uuidUsage.entries()) usageData[k] = { ...v, connects: activeConns.get(k) || 0 };
             let baseHost = hostName;
             let protocol = "https";
             if (sysConfig.customPanelUrl && sysConfig.customPanelUrl.trim()) {
@@ -1770,10 +2047,22 @@ async function handleConfigSync(request, env, ctx) {
             if (sysUsageCache.users[uuidClean]) {
                 sysUsageCache.users[uuidClean].reqs = 0;
                 sysUsageCache.users[uuidClean].dReqs = 0;
+                sysUsageCache.users[uuidClean].bytes = 0;
+                sysUsageCache.users[uuidClean].dBytes = 0;
             } else {
-                sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+                sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, bytes: 0, dBytes: 0, lastDay: new Date().toISOString().split('T')[0] };
             }
-            await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            const resetAt = Date.now();
+            if (uuidUsage.has(uuidClean)) { uuidUsage.get(uuidClean).bytes = 0; uuidUsage.get(uuidClean).last = resetAt; }
+            let ru = sysUsageCache.users[uuidClean];
+            if (ru) ru.resetAt = resetAt;
+            sysUsageDirty = true;
+            sysUsageRev++;
+            await persistUsage(env);
+            sysConfig.usageEpoch = { t: resetAt, id: uuidClean };
+            lastUsageEpoch = resetAt;
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            persistUuidUsage(env, ctx);
         }
 
         if (data.config && !data.fromMaster && nextConfig.slaveNodes && nextConfig.slaveNodes.trim().length > 0) {
@@ -1786,7 +2075,7 @@ async function handleConfigSync(request, env, ctx) {
             ['cfAccountId', 'cfApiToken', 'cfWorkerName', 'tgToken', 'tgChatId', 'tgAdminId'].forEach(k => delete slaveConfig[k]);
             nodes.forEach(node => {
                 if(node !== currentHost) {
-                     ctx?.waitUntil(fetch(`https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`, {
+                     ctx?.waitUntil(fetchT(`https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`, {
                          method: 'POST',
                          headers: { 'Content-Type': 'application/json' },
                          body: JSON.stringify({ key: syncKey, config: slaveConfig, fromMaster: true })
@@ -1797,7 +2086,7 @@ async function handleConfigSync(request, env, ctx) {
         
         if (nextConfig.tgToken && ctx) {
             const hookUrl = `https://${new URL(request.url).hostname}/${encodeURI(nextConfig.apiRoute)}/tg`;
-            ctx.waitUntil(fetch(`https://api.telegram.org/bot${nextConfig.tgToken}/setWebhook`, {
+            ctx.waitUntil(fetchT(`https://api.telegram.org/bot${nextConfig.tgToken}/setWebhook`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ url: hookUrl })
@@ -2087,7 +2376,7 @@ async function remotePanelFetch(panel, method, path, body = null) {
             headers: { 'Content-Type': 'application/json' }
         };
         if (body) options.body = JSON.stringify(body);
-        const res = await fetch(url, { ...options, signal: AbortSignal.timeout(8000) });
+        const res = await fetchT(url, options, 8000);
         return await res.json();
     } catch(e) {
         return { success: false, error: e.message };
@@ -2098,16 +2387,8 @@ async function fetchRemotePanelUsers(panel) {
     return await remotePanelFetch(panel, 'GET', `/api/users?key=${encodeURIComponent(panel.apiKey)}`);
 }
 
-async function fetchRemotePanelUser(panel, userId) {
-    return await remotePanelFetch(panel, 'GET', `/api/users?id=${encodeURIComponent(userId)}&key=${encodeURIComponent(panel.apiKey)}`);
-}
-
 async function fetchRemotePanelStats(panel) {
     return await remotePanelFetch(panel, 'GET', `/api/stats?key=${encodeURIComponent(panel.apiKey)}`);
-}
-
-async function fetchRemotePanelConfig(panel) {
-    return await remotePanelFetch(panel, 'POST', '/api/auth', { key: panel.apiKey });
 }
 
 async function remotePanelWriteAction(panel, method, userId, body = null) {
@@ -2140,7 +2421,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
         if (!isAuthorized) {
             const chatId = update.callback_query?.message?.chat?.id || update.message?.chat?.id;
             if (chatId) {
-                await fetch(`${tgApi}/sendMessage`, {
+                await fetchT(`${tgApi}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
@@ -2189,7 +2470,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
         const sendOrEdit = async (chatId, text, replyMarkup = null, messageId = null) => {
             let res;
             if (messageId) {
-                res = await fetch(`${tgApi}/editMessageText`, {
+                res = await fetchT(`${tgApi}/editMessageText`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -2206,7 +2487,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     if (errBody?.description?.includes("message is not modified")) return res;
                 } catch (e) {}
             }
-            res = await fetch(`${tgApi}/sendMessage`, {
+            res = await fetchT(`${tgApi}/sendMessage`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -2262,6 +2543,12 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                 ]);
                 inline_keyboard.push([
                     { text: `📋 ${t("tg_logs")}`, callback_data: "tg_logs_menu" }
+                ]);
+                inline_keyboard.push([
+                    { text: `🔗 ${t("relays")}`, callback_data: "tg_relays_menu" }
+                ]);
+                inline_keyboard.push([
+                    { text: `📦 ${t("bulk_ops")}`, callback_data: "tg_bulk_menu" }
                 ]);
             }
             inline_keyboard.push([
@@ -2343,8 +2630,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             
             const limitTotalTxt = u.limitTotalReq ? `${u.limitTotalReq}` : t("unlimited");
             const limitDailyTxt = u.limitDailyReq ? `${u.limitDailyReq}` : t("unlimited");
-            const usedGB = (userReqs / 6000).toFixed(2);
-            const limitGB = u.limitTotalReq ? (u.limitTotalReq / 6000).toFixed(2) : t("unlimited");
+            const usedGB = (usageTotalBytes(sysU) / 1073741824).toFixed(2);
+            const limitGB = u.limitTotalReq ? (limitReqToBytes(u.limitTotalReq) / 1073741824).toFixed(2) : t("unlimited");
             
             let expTxt = t("unlimited");
             let isExp = false;
@@ -2413,6 +2700,10 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         { text: `📱 ${t("device_limit")}`, callback_data: `sub_edit_device_init:${u.id}` }
                     ],
                     [
+                        { text: `🔗 ${t("copy_link")}`, callback_data: `sub_copy_link:${u.id}` },
+                        { text: `📋 ${t("config_links")}`, callback_data: `sub_config_links:${u.id}` }
+                    ],
+                    [
                         { text: t("btn_back_to_list"), callback_data: "subs_list:0" }
                     ]
                 ]
@@ -2428,7 +2719,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
 
             if (chatId) {
                 if (!isAuthorized) {
-                    await fetch(`${tgApi}/answerCallbackQuery`, {
+                    await fetchT(`${tgApi}/answerCallbackQuery`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ callback_query_id: cb.id, text: t("access_denied"), show_alert: true })
@@ -2499,6 +2790,99 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         const list = getSubsList(page, panelUsers);
                         await sendOrEdit(chatId, list.text, list.kb, messageId);
                     }
+                } else if (data.startsWith("sub_copy_link:")) {
+                    const uuid = data.replace("sub_copy_link:", "");
+                    const panelUsers = await getPanelUsers();
+                    const u = panelUsers?.find(usr => usr.id === uuid);
+                    if (u) {
+                        const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
+                        await fetchT(`${tgApi}/sendMessage`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ chat_id: chatId, text: `\`${subSync}\``, parse_mode: 'Markdown' })
+                        });
+                        answerText = t("sub_link_sent");
+                    } else {
+                        answerText = t("msg_panel_error");
+                    }
+                } else if (data.startsWith("sub_config_links:")) {
+                    const uuid = data.replace("sub_config_links:", "");
+                    const panelUsers = await getPanelUsers();
+                    const u = panelUsers?.find(usr => usr.id === uuid);
+                    if (u) {
+                        const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
+                        const text = `📋 **${t("config_links")}**\n\n` +
+                            `• [Clash](${subSync}&flag=clash)\n` +
+                            `• [sing-box](${subSync}&flag=sing)\n` +
+                            `• [v2rayN](${subSync}&flag=vjson)\n` +
+                            `• [Raw](${subSync}&flag=a)`;
+                        const kb = { inline_keyboard: [
+                            [{ text: t("btn_back"), callback_data: `sub_detail:${uuid}` }]
+                        ]};
+                        await sendOrEdit(chatId, text, kb, messageId);
+                    } else {
+                        answerText = t("msg_panel_error");
+                    }
+                } else if (data.startsWith("sub_extra_ports:")) {
+                    const uuid = data.replace("sub_extra_ports:", "");
+                    tgState[chatId] = { step: "sub_extra_ports", uuid: uuid };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🔌 **${t("ports")}**\n${t("tg_current_val")}: \`${sysConfig.socketPorts || '443'}\`\n\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_extra_done:${uuid}` }]] }, messageId);
+                } else if (data.startsWith("sub_extra_mode:")) {
+                    const uuid = data.replace("sub_extra_mode:", "");
+                    tgState[chatId] = { step: "sub_extra_mode", uuid: uuid };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    const kb = { inline_keyboard: [
+                        [{ text: "Alpha (VLESS)", callback_data: `sub_extra_mode_set:${uuid}:alpha` }],
+                        [{ text: "Beta (Trojan)", callback_data: `sub_extra_mode_set:${uuid}:beta` }],
+                        [{ text: "Both", callback_data: `sub_extra_mode_set:${uuid}:both` }],
+                        [{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_extra_done:${uuid}` }]
+                    ] };
+                    await sendOrEdit(chatId, `📡 **${t("mode")}**\n${t("tg_current_val")}: **${sysConfig.mode || 'alpha'}**`, kb, messageId);
+                } else if (data.startsWith("sub_extra_mode_set:")) {
+                    const parts = data.replace("sub_extra_mode_set:", "").split(":");
+                    const uuid = parts[0];
+                    const mode = parts[1];
+                    const panelUsers = await getPanelUsers();
+                    const u = panelUsers?.find(usr => usr.id === uuid);
+                    if (u) {
+                        u.userMode = mode;
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    }
+                    tgState[chatId] = { step: "sub_add_extra", uuid: uuid };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    answerText = t("tg_saved");
+                    const extraKb = { inline_keyboard: [
+                        [{ text: `🔌 ${t("ports")}`, callback_data: `sub_extra_ports:${uuid}` }],
+                        [{ text: `📡 ${t("mode")}`, callback_data: `sub_extra_mode:${uuid}` }],
+                        [{ text: `🔗 ${t("proxy_ips")}`, callback_data: `sub_extra_proxy:${uuid}` }],
+                        [{ text: `🧹 ${t("clean_ips")}`, callback_data: `sub_extra_clean:${uuid}` }],
+                        [{ text: `📱 ${t("device_limit")}`, callback_data: `sub_extra_device:${uuid}` }],
+                        [{ text: `✅ ${t("done")}`, callback_data: `sub_extra_done:${uuid}` }]
+                    ] };
+                    await sendOrEdit(chatId, `✅ ${t("mode")}: **${mode}**\n\n${t("extra_settings_desc")}`, extraKb, messageId);
+                } else if (data.startsWith("sub_extra_proxy:")) {
+                    const uuid = data.replace("sub_extra_proxy:", "");
+                    tgState[chatId] = { step: "sub_extra_proxy", uuid: uuid };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🔗 **${t("proxy_ips")}**\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_extra_done:${uuid}` }]] }, messageId);
+                } else if (data.startsWith("sub_extra_clean:")) {
+                    const uuid = data.replace("sub_extra_clean:", "");
+                    tgState[chatId] = { step: "sub_extra_clean", uuid: uuid };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `🧹 **${t("clean_ips")}**\n${t("tg_new_val")}\n_send empty to clear_`, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_extra_done:${uuid}` }]] }, messageId);
+                } else if (data.startsWith("sub_extra_device:")) {
+                    const uuid = data.replace("sub_extra_device:", "");
+                    tgState[chatId] = { step: "sub_extra_device", uuid: uuid };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `📱 **${t("device_limit")}**\n${t("tg_new_val")}`, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_extra_done:${uuid}` }]] }, messageId);
+                } else if (data.startsWith("sub_extra_done:")) {
+                    const uuid = data.replace("sub_extra_done:", "");
+                    tgState[chatId] = null;
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    const panelUsers = await getPanelUsers();
+                    const detail = getSubDetail(uuid, panelUsers);
+                    await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb, messageId);
                 } else if (data.startsWith("sub_detail:")) {
                     const uuid = data.replace("sub_detail:", "");
                     const panelUsers = await getPanelUsers();
@@ -2691,30 +3075,30 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, dashText, kb, messageId);
                 } else if (data === "sys_stats") {
-                    let users, totalReqs, dailyReqs;
+                    let users, totalBytes, dailyBytes;
                     if (isRemotePanel) {
                         const statsRes = await fetchRemotePanelStats(activePanel);
                         if (statsRes.success && statsRes.stats) {
                             const s = statsRes.stats;
                             users = [];
-                            totalReqs = s.traffic?.totalRequests || 0;
-                            dailyReqs = s.traffic?.dailyRequests || 0;
+                            totalBytes = Math.floor(Number(s.traffic?.totalGB) * 1073741824) || 0;
+                            dailyBytes = Math.floor(Number(s.traffic?.dailyGB) * 1073741824) || 0;
                         } else {
                             const panelUsers = await getPanelUsers();
                             users = panelUsers || [];
-                            totalReqs = 0;
-                            dailyReqs = 0;
+                            totalBytes = 0;
+                            dailyBytes = 0;
                         }
                     } else {
                         users = sysConfig.users || [];
-                        totalReqs = 0;
-                        dailyReqs = 0;
+                        totalBytes = 0;
+                        dailyBytes = 0;
                         const todayDate = new Date().toISOString().split('T')[0];
                         users.forEach(u => {
                             const idClean = u.id.replace(/-/g, '').toLowerCase();
                             const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
-                            totalReqs += (sysU.reqs || 0);
-                            if (sysU.lastDay === todayDate) dailyReqs += (sysU.dReqs || 0);
+                            totalBytes += usageTotalBytes(sysU);
+                            dailyBytes += usageDailyBytes(sysU, todayDate);
                         });
                     }
                     let statsText = `📈 **${t("stats_title")}**\n`;
@@ -2722,8 +3106,8 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     statsText += `📌 **${t("current_panel")}**: ${activePanel.isLocal ? '🏠' : '🌐'} ${activePanel.name}\n`;
                     statsText += `━━━━━━━━━━━━━━━━\n`;
                     statsText += `👥 **${t("dash_total")}**: ${Array.isArray(users) ? users.length : 'N/A'}\n`;
-                    statsText += `📊 **${t("total_traffic")}**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
-                    statsText += `📅 **${t("daily_traffic")}**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
+                    statsText += `📊 **${t("total_traffic")}**: ${(totalBytes / 1073741824).toFixed(2)} GB\n`;
+                    statsText += `📅 **${t("daily_traffic")}**: ${(dailyBytes / 1073741824).toFixed(2)} GB\n`;
                     if (!isRemotePanel) {
                         const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
                         const dh = Math.floor(upSeconds / 3600);
@@ -2806,10 +3190,22 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         if (sysUsageCache.users[uuidClean]) {
                             sysUsageCache.users[uuidClean].reqs = 0;
                             sysUsageCache.users[uuidClean].dReqs = 0;
+                            sysUsageCache.users[uuidClean].bytes = 0;
+                            sysUsageCache.users[uuidClean].dBytes = 0;
                         } else {
-                            sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+                            sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, bytes: 0, dBytes: 0, lastDay: new Date().toISOString().split('T')[0] };
                         }
-                        await cachedD1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            const resetAt = Date.now();
+            if (uuidUsage.has(uuidClean)) { uuidUsage.get(uuidClean).bytes = 0; uuidUsage.get(uuidClean).last = resetAt; }
+            let ru = sysUsageCache.users[uuidClean];
+            if (ru) ru.resetAt = resetAt;
+            sysUsageDirty = true;
+            sysUsageRev++;
+            await persistUsage(env);
+            sysConfig.usageEpoch = { t: resetAt, id: uuidClean };
+            lastUsageEpoch = resetAt;
+            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+            persistUuidUsage(env, ctx);
                     }
                     const panelUsers = await getPanelUsers();
                     const detail = getSubDetail(uuid, panelUsers);
@@ -2854,7 +3250,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, `✅ ${t("status_updated")}`, detail.kb, messageId);
                 } else if (data === "get_sub_link") {
                     const subUrl = `https://${hostName}/${sysConfig.apiRoute}`;
-                    await fetch(`${tgApi}/sendMessage`, {
+                    await fetchT(`${tgApi}/sendMessage`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ chat_id: chatId, text: `\`${subUrl}\``, parse_mode: 'Markdown' })
@@ -2894,6 +3290,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         [{ text: `${t("tg_silent")}`, callback_data: "tg_toggle_silent" }, { text: `${t("tg_pause")}`, callback_data: "tg_toggle_pause2" }],
                         [{ text: `🔄 ${t("tg_auto_update")}`, callback_data: "tg_toggle_auto_update" }, { text: `🔀 ${t("tg_direct")}`, callback_data: "tg_toggle_direct" }],
                         [{ text: `🌐 ${t("tg_nat64")}`, callback_data: "tg_edit_nat64" }],
+                        [{ text: `🔔 ${t("tg_notifications")}`, callback_data: "tg_notifications_menu" }],
                         [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
                     ] };
                     await sendOrEdit(chatId, text, kb, messageId);
@@ -2920,6 +3317,130 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
                     ] };
                     await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data === "tg_relays_menu") {
+                    let relayText = `🔗 **${t("relays")}**\n━━━━━━━━━━━━━━━━\n`;
+                    const inventory = collectRelayInventory();
+                    if (inventory.length === 0) {
+                        relayText += `ℹ️ ${t("no_relays")}\n`;
+                    } else {
+                        inventory.forEach(r => {
+                            const rk = relayKeyOf(r.host + ":" + r.port);
+                            const quarantined = rk ? isRelayQuarantined(rk.host, rk.port) : false;
+                            const status = quarantined ? "🔴" : "🟢";
+                            relayText += `${status} \`${r.host}:${r.port}\`\n`;
+                        });
+                    }
+                    relayText += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `🔄 ${t("btn_update_usage")}`, callback_data: "tg_relays_menu" }],
+                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, relayText, kb, messageId);
+                } else if (data === "tg_bulk_menu") {
+                    const bulkText = `📦 **${t("bulk_ops")}**\n━━━━━━━━━━━━━━━━\n`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `🔄 ${t("bulk_reset_all")}`, callback_data: "tg_bulk_reset_all" }],
+                        [{ text: `📅 ${t("bulk_extend_all")}`, callback_data: "tg_bulk_extend_init" }],
+                        [{ text: `🗑️ ${t("bulk_delete")}`, callback_data: "tg_bulk_delete_init" }],
+                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, bulkText, kb, messageId);
+                } else if (data === "tg_bulk_reset_all") {
+                    const panelUsers = await getPanelUsers();
+                    const users = panelUsers || [];
+                    if (!sysUsageCache) sysUsageCache = { users: {} };
+                    if (!sysUsageCache.users) sysUsageCache.users = {};
+                    users.forEach(u => {
+                        const idClean = u.id.replace(/-/g, '').toLowerCase();
+                        if (sysUsageCache.users[idClean]) {
+                            sysUsageCache.users[idClean].reqs = 0;
+                            sysUsageCache.users[idClean].dReqs = 0;
+                            sysUsageCache.users[idClean].bytes = 0;
+                            sysUsageCache.users[idClean].dBytes = 0;
+                        } else {
+                            sysUsageCache.users[idClean] = { reqs: 0, dReqs: 0, bytes: 0, dBytes: 0, lastDay: new Date().toISOString().split('T')[0] };
+                        }
+                        if (uuidUsage.has(idClean)) { uuidUsage.get(idClean).bytes = 0; uuidUsage.get(idClean).last = Date.now(); }
+                    });
+                    sysUsageDirty = true;
+                    sysUsageRev++;
+                    await persistUsage(env);
+                    sysConfig.usageEpoch = { t: Date.now(), id: "all" };
+                    lastUsageEpoch = sysConfig.usageEpoch.t;
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    persistUuidUsage(env, ctx);
+                    answerText = t("msg_traffic_reset");
+                    const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, `✅ ${t("bulk_reset_all")}`, kb, messageId);
+                } else if (data === "tg_bulk_extend_init") {
+                    tgState[chatId] = { step: "tg_bulk_extend" };
+                    ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                    await sendOrEdit(chatId, `📅 **${t("bulk_extend_all")}**\n\n${t("msg_enter_extend_days")}`, { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "tg_bulk_menu" }]] }, messageId);
+                } else if (data === "tg_bulk_delete_init") {
+                    const panelUsers = await getPanelUsers();
+                    const users = panelUsers || [];
+                    if (users.length === 0) {
+                        await sendOrEdit(chatId, t("no_users"), { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] }, messageId);
+                    } else {
+                        tgState[chatId] = { step: "tg_bulk_delete", selected: [] };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        let delText = `🗑️ **${t("bulk_delete")}**\n\n${t("bulk_delete_select")}\n\n`;
+                        const delKb = { inline_keyboard: [] };
+                        users.forEach(u => {
+                            delText += `👤 ${u.name}\n`;
+                            delKb.inline_keyboard.push([{ text: `✅ ${u.name}`, callback_data: `tg_bulk_del_toggle:${u.id}` }]);
+                        });
+                        delKb.inline_keyboard.push([
+                            { text: `🗑️ ${t("bulk_delete_confirm")}`, callback_data: "tg_bulk_del_confirm" },
+                            { text: `❌ ${t("btn_cancel")}`, callback_data: "tg_bulk_menu" }
+                        ]);
+                        await sendOrEdit(chatId, delText, delKb, messageId);
+                    }
+                } else if (data.startsWith("tg_bulk_del_toggle:")) {
+                    const uuid = data.replace("tg_bulk_del_toggle:", "");
+                    const state = tgState[chatId];
+                    if (state && state.step === "tg_bulk_delete") {
+                        const idx = state.selected.indexOf(uuid);
+                        if (idx >= 0) state.selected.splice(idx, 1);
+                        else state.selected.push(uuid);
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        const panelUsers = await getPanelUsers();
+                        const users = panelUsers || [];
+                        let delText = `🗑️ **${t("bulk_delete")}**\n\n${t("bulk_delete_select")}\n\n`;
+                        const delKb = { inline_keyboard: [] };
+                        users.forEach(u => {
+                            const isSel = state.selected.includes(u.id);
+                            delText += `${isSel ? '✅' : '👤'} ${u.name}\n`;
+                            delKb.inline_keyboard.push([{ text: `${isSel ? '☑️' : '⬜️'} ${u.name}`, callback_data: `tg_bulk_del_toggle:${u.id}` }]);
+                        });
+                        delKb.inline_keyboard.push([
+                            { text: `🗑️ ${t("bulk_delete_confirm")}`, callback_data: "tg_bulk_del_confirm" },
+                            { text: `❌ ${t("btn_cancel")}`, callback_data: "tg_bulk_menu" }
+                        ]);
+                        await sendOrEdit(chatId, delText, delKb, messageId);
+                    }
+                } else if (data === "tg_bulk_del_confirm") {
+                    const state = tgState[chatId];
+                    if (state && state.step === "tg_bulk_delete" && state.selected.length > 0) {
+                        const panelUsers = await getPanelUsers();
+                        const users = panelUsers || [];
+                        const toDelete = state.selected;
+                        if (isRemotePanel) {
+                            for (const uid of toDelete) {
+                                await remotePanelWriteAction(activePanel, 'DELETE', uid);
+                            }
+                        } else if (sysConfig.users) {
+                            sysConfig.users = sysConfig.users.filter(usr => !toDelete.includes(usr.id));
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        }
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        answerText = `${t("msg_deleted")} (${toDelete.length})`;
+                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                        await sendOrEdit(chatId, `✅ ${t("bulk_delete")} ${toDelete.length} ${t("msg_deleted")}`, kb, messageId);
+                    } else {
+                        answerText = t("msg_panel_error");
+                    }
                 } else if (data === "tg_logs_menu") {
                     let logs = [];
                     if (env.IOT_DB) {
@@ -2942,6 +3463,46 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
                     ] };
                     await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data === "tg_notifications_menu") {
+                    if (!sysConfig.tgNotifs) sysConfig.tgNotifs = { userCreated: true, userDeleted: true, limitReached: true, dailyLimit: true, expiry: true, relayBuried: true, relayResurrected: true, panelUpdated: true, loginSuccess: false, loginFailed: true };
+                    const n = sysConfig.tgNotifs;
+                    const notifText = `🔔 **${t("tg_notifications")}**\n━━━━━━━━━━━━━━━━\n`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `👤 ${t("notif_user_created")}: ${n.userCreated ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:userCreated" }],
+                        [{ text: `🗑️ ${t("notif_user_deleted")}: ${n.userDeleted ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:userDeleted" }],
+                        [{ text: `📊 ${t("notif_limit")}: ${n.limitReached ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:limitReached" }],
+                        [{ text: `📅 ${t("notif_daily")}: ${n.dailyLimit ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:dailyLimit" }],
+                        [{ text: `⏳ ${t("notif_expiry")}: ${n.expiry ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:expiry" }],
+                        [{ text: `⚰️ ${t("notif_relay_buried")}: ${n.relayBuried ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:relayBuried" }],
+                        [{ text: `🔄 ${t("notif_relay_resurrected")}: ${n.relayResurrected ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:relayResurrected" }],
+                        [{ text: `🔄 ${t("notif_panel_updated")}: ${n.panelUpdated ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:panelUpdated" }],
+                        [{ text: `🔑 ${t("notif_login_success")}: ${n.loginSuccess ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:loginSuccess" }],
+                        [{ text: `❌ ${t("notif_login_failed")}: ${n.loginFailed ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:loginFailed" }],
+                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, notifText, kb, messageId);
+                } else if (data.startsWith("tg_notif_toggle:")) {
+                    const key = data.replace("tg_notif_toggle:", "");
+                    if (!sysConfig.tgNotifs) sysConfig.tgNotifs = {};
+                    sysConfig.tgNotifs[key] = !sysConfig.tgNotifs[key];
+                    await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                    answerText = t("tg_saved");
+                    const n = sysConfig.tgNotifs;
+                    const notifText = `🔔 **${t("tg_notifications")}**\n━━━━━━━━━━━━━━━━\n`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `👤 ${t("notif_user_created")}: ${n.userCreated ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:userCreated" }],
+                        [{ text: `🗑️ ${t("notif_user_deleted")}: ${n.userDeleted ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:userDeleted" }],
+                        [{ text: `📊 ${t("notif_limit")}: ${n.limitReached ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:limitReached" }],
+                        [{ text: `📅 ${t("notif_daily")}: ${n.dailyLimit ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:dailyLimit" }],
+                        [{ text: `⏳ ${t("notif_expiry")}: ${n.expiry ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:expiry" }],
+                        [{ text: `⚰️ ${t("notif_relay_buried")}: ${n.relayBuried ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:relayBuried" }],
+                        [{ text: `🔄 ${t("notif_relay_resurrected")}: ${n.relayResurrected ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:relayResurrected" }],
+                        [{ text: `🔄 ${t("notif_panel_updated")}: ${n.panelUpdated ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:panelUpdated" }],
+                        [{ text: `🔑 ${t("notif_login_success")}: ${n.loginSuccess ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:loginSuccess" }],
+                        [{ text: `❌ ${t("notif_login_failed")}: ${n.loginFailed ? '✅' : '❌'}`, callback_data: "tg_notif_toggle:loginFailed" }],
+                        [{ text: t("btn_main_menu"), callback_data: "main_menu" }]
+                    ] };
+                    await sendOrEdit(chatId, notifText, kb, messageId);
                 } else if (data === "tg_toggle_tfo") {
                     sysConfig.enableOpt1 = !sysConfig.enableOpt1;
                     await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
@@ -3056,7 +3617,7 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     await sendOrEdit(chatId, `☁️ **${t("tg_cf_settings")}**\n\n1️⃣ CF Account ID: \`${sysConfig.cfAccountId || '—'}\`\n\n${t("tg_new_val")}\n_send /skip to keep current_`, { inline_keyboard: [[{ text: "❌ " + t("btn_cancel"), callback_data: "tg_advanced_menu" }]] }, messageId);
                 }
                 
-                ctx?.waitUntil(fetch(`${tgApi}/answerCallbackQuery`, {
+                ctx?.waitUntil(fetchT(`${tgApi}/answerCallbackQuery`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ callback_query_id: cb.id, text: answerText || "Done!" })
@@ -3157,9 +3718,19 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                             const detail = getSubDetail(newUuid);
                             await sendOrEdit(chatId, `✅ ${t("msg_added")}\n\n${detail.text}`, detail.kb);
                         }
-                        
-                        tgState[chatId] = null;
+
+                        tgState[chatId] = { step: "sub_add_extra", uuid: newUuid };
                         ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        const extraText = `⚙️ **${t("extra_settings")}**\n\n${t("extra_settings_desc")}`;
+                        const extraKb = { inline_keyboard: [
+                            [{ text: `🔌 ${t("ports")}`, callback_data: `sub_extra_ports:${newUuid}` }],
+                            [{ text: `📡 ${t("mode")}`, callback_data: `sub_extra_mode:${newUuid}` }],
+                            [{ text: `🔗 ${t("proxy_ips")}`, callback_data: `sub_extra_proxy:${newUuid}` }],
+                            [{ text: `🧹 ${t("clean_ips")}`, callback_data: `sub_extra_clean:${newUuid}` }],
+                            [{ text: `📱 ${t("device_limit")}`, callback_data: `sub_extra_device:${newUuid}` }],
+                            [{ text: `✅ ${t("done")}`, callback_data: `sub_extra_done:${newUuid}` }]
+                        ] };
+                        await sendOrEdit(chatId, extraText, extraKb);
                         return new Response("OK", { status: 200 });
                     }
                     
@@ -3320,6 +3891,120 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         return new Response("OK", { status: 200 });
                     }
                     
+                    if (state.step === "tg_bulk_extend") {
+                        const days = parseInt(text);
+                        if (isNaN(days) || days <= 0) {
+                            await sendOrEdit(chatId, t("msg_invalid"));
+                            return new Response("OK", { status: 200 });
+                        }
+                        const panelUsers = await getPanelUsers();
+                        const users = panelUsers || [];
+                        let extended = 0;
+                        users.forEach(u => {
+                            if (u.expiryMs) {
+                                u.expiryMs += days * 86400000;
+                                extended++;
+                            } else {
+                                u.expiryMs = Date.now() + days * 86400000;
+                                extended++;
+                            }
+                        });
+                        await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        tgState[chatId] = null;
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        answerText = `${t("msg_expiry_extended").replace("{days}", days)} (${extended})`;
+                        const kb = { inline_keyboard: [[{ text: t("btn_main_menu"), callback_data: "main_menu" }]] };
+                        await sendOrEdit(chatId, `✅ ${t("bulk_extend_all")}: ${extended} ${t("msg_expiry_extended").replace("{days}", days)}`, kb);
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "sub_extra_ports") {
+                        const uuid = state.uuid;
+                        const panelUsers = await getPanelUsers();
+                        const u = panelUsers?.find(usr => usr.id === uuid);
+                        if (u) {
+                            u.userPorts = text || null;
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        }
+                        tgState[chatId] = { step: "sub_add_extra", uuid: uuid };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        answerText = t("tg_saved");
+                        const extraKb = { inline_keyboard: [
+                            [{ text: `🔌 ${t("ports")}`, callback_data: `sub_extra_ports:${uuid}` }],
+                            [{ text: `📡 ${t("mode")}`, callback_data: `sub_extra_mode:${uuid}` }],
+                            [{ text: `🔗 ${t("proxy_ips")}`, callback_data: `sub_extra_proxy:${uuid}` }],
+                            [{ text: `🧹 ${t("clean_ips")}`, callback_data: `sub_extra_clean:${uuid}` }],
+                            [{ text: `📱 ${t("device_limit")}`, callback_data: `sub_extra_device:${uuid}` }],
+                            [{ text: `✅ ${t("done")}`, callback_data: `sub_extra_done:${uuid}` }]
+                        ] };
+                        await sendOrEdit(chatId, `✅ ${t("ports")}: \`${text || '—'}\`\n\n${t("extra_settings_desc")}`, extraKb);
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "sub_extra_proxy") {
+                        const uuid = state.uuid;
+                        const panelUsers = await getPanelUsers();
+                        const u = panelUsers?.find(usr => usr.id === uuid);
+                        if (u) {
+                            u.proxyIp = text || null;
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        }
+                        tgState[chatId] = { step: "sub_add_extra", uuid: uuid };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        answerText = t("tg_saved");
+                        const extraKb = { inline_keyboard: [
+                            [{ text: `🔌 ${t("ports")}`, callback_data: `sub_extra_ports:${uuid}` }],
+                            [{ text: `📡 ${t("mode")}`, callback_data: `sub_extra_mode:${uuid}` }],
+                            [{ text: `🔗 ${t("proxy_ips")}`, callback_data: `sub_extra_proxy:${uuid}` }],
+                            [{ text: `🧹 ${t("clean_ips")}`, callback_data: `sub_extra_clean:${uuid}` }],
+                            [{ text: `📱 ${t("device_limit")}`, callback_data: `sub_extra_device:${uuid}` }],
+                            [{ text: `✅ ${t("done")}`, callback_data: `sub_extra_done:${uuid}` }]
+                        ] };
+                        await sendOrEdit(chatId, `✅ ${t("proxy_ips")}: \`${text || '—'}\`\n\n${t("extra_settings_desc")}`, extraKb);
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "sub_extra_clean") {
+                        const uuid = state.uuid;
+                        const panelUsers = await getPanelUsers();
+                        const u = panelUsers?.find(usr => usr.id === uuid);
+                        if (u) {
+                            u.cleanIp = text || null;
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        }
+                        tgState[chatId] = { step: "sub_add_extra", uuid: uuid };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        answerText = t("tg_saved");
+                        const extraKb = { inline_keyboard: [
+                            [{ text: `🔌 ${t("ports")}`, callback_data: `sub_extra_ports:${uuid}` }],
+                            [{ text: `📡 ${t("mode")}`, callback_data: `sub_extra_mode:${uuid}` }],
+                            [{ text: `🔗 ${t("proxy_ips")}`, callback_data: `sub_extra_proxy:${uuid}` }],
+                            [{ text: `🧹 ${t("clean_ips")}`, callback_data: `sub_extra_clean:${uuid}` }],
+                            [{ text: `📱 ${t("device_limit")}`, callback_data: `sub_extra_device:${uuid}` }],
+                            [{ text: `✅ ${t("done")}`, callback_data: `sub_extra_done:${uuid}` }]
+                        ] };
+                        await sendOrEdit(chatId, `✅ ${t("clean_ips")}: \`${text || '—'}\`\n\n${t("extra_settings_desc")}`, extraKb);
+                        return new Response("OK", { status: 200 });
+                    }
+                    if (state.step === "sub_extra_device") {
+                        const uuid = state.uuid;
+                        const panelUsers = await getPanelUsers();
+                        const u = panelUsers?.find(usr => usr.id === uuid);
+                        if (u) {
+                            u.connLimit = text ? parseInt(text) : null;
+                            await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        }
+                        tgState[chatId] = { step: "sub_add_extra", uuid: uuid };
+                        ctx?.waitUntil(d1Put(env, "tg_bot_state", JSON.stringify(tgState)).catch(()=>{}));
+                        answerText = t("tg_saved");
+                        const extraKb = { inline_keyboard: [
+                            [{ text: `🔌 ${t("ports")}`, callback_data: `sub_extra_ports:${uuid}` }],
+                            [{ text: `📡 ${t("mode")}`, callback_data: `sub_extra_mode:${uuid}` }],
+                            [{ text: `🔗 ${t("proxy_ips")}`, callback_data: `sub_extra_proxy:${uuid}` }],
+                            [{ text: `🧹 ${t("clean_ips")}`, callback_data: `sub_extra_clean:${uuid}` }],
+                            [{ text: `📱 ${t("device_limit")}`, callback_data: `sub_extra_device:${uuid}` }],
+                            [{ text: `✅ ${t("done")}`, callback_data: `sub_extra_done:${uuid}` }]
+                        ] };
+                        await sendOrEdit(chatId, `✅ ${t("device_limit")}: \`${text || '—'}\`\n\n${t("extra_settings_desc")}`, extraKb);
+                        return new Response("OK", { status: 200 });
+                    }
                     if (state.step === "tg_edit_dns") {
                         sysConfig.resolveIp = text;
                         await cachedD1Put(env, "sys_config", JSON.stringify(sysConfig));
@@ -3500,12 +4185,34 @@ async function processTelemetryStream(env, ctx, wsRelayIdx) {
 
 async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
     activeConnections++;
+    let activeClientHash = null;
+    let connBytesUp = 0;
+    let connBytesDown = 0;
+    let flushedUp = 0;
+    let flushedDown = 0;
+    let lastByteFlush = 0;
+    let activeRelay = null;
+    let relayConfirmed = false;
+    const flushUsage = (force) => {
+        if (!activeClientHash) return;
+        const pending = (connBytesUp - flushedUp) + (connBytesDown - flushedDown);
+        if (pending <= 0) return;
+        if (!force && Date.now() - lastByteFlush < 10000) return;
+        lastByteFlush = Date.now();
+        flushedUp = connBytesUp;
+        flushedDown = connBytesDown;
+        let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: Date.now(), bytes: 0 };
+        uTrack.bytes = (uTrack.bytes || 0) + pending;
+        uuidUsage.set(activeClientHash, uTrack);
+        trackUsage(activeClientHash, pending, env, ctx);
+    };
     webSocket.addEventListener('close', () => {
         activeConnections--;
         if (activeClientHash) {
             let cur = activeConns.get(activeClientHash) || 0;
             if (cur > 0) activeConns.set(activeClientHash, cur - 1);
         }
+        flushUsage(true);
     });
     webSocket.addEventListener('error', () => {
         activeConnections--;
@@ -3513,9 +4220,9 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
             let cur = activeConns.get(activeClientHash) || 0;
             if (cur > 0) activeConns.set(activeClientHash, cur - 1);
         }
+        flushUsage(true);
     });
     let remoteSocket, dataWriter, isInit = true, queue = Promise.resolve();
-    let activeClientHash = null;
     webSocket.addEventListener("message", (event) => {
         queue = queue.then(async () => {
             try {
@@ -3525,6 +4232,8 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                     if (isModeAlpha) webSocket.send(new Uint8Array([0, 0]));
                 } else if (dataWriter) {
                     await dataWriter.write(event.data);
+                    connBytesUp += event.data?.byteLength || 0;
+                    flushUsage();
                 }
             } catch (err) { webSocket.close(); }
         });
@@ -3574,7 +4283,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                 activeConns.set(activeClientHash, currentConns + 1);
             }
             
-            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
+            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0, bytes: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
             uuidUsage.set(activeClientHash, uTrack);
@@ -3621,7 +4330,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                 }
                 activeConns.set(activeClientHash, currentConns + 1);
             }
-            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0 };
+            let uTrack = uuidUsage.get(activeClientHash) || { connects: 0, last: 0, bytes: 0 };
             uTrack.connects++;
             uTrack.last = Date.now();
             uuidUsage.set(activeClientHash, uTrack);
@@ -3645,7 +4354,7 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
                 const dohUrl = new URL(sysConfig.customDns);
                 dohUrl.searchParams.set("name", targetAddr);
                 dohUrl.searchParams.set("type", "A");
-                let dnsRes = await fetch(dohUrl.toString(), { headers: { "accept": "application/dns-json" }});
+                let dnsRes = await fetchT(dohUrl.toString(), { headers: { "accept": "application/dns-json" }});
                 let dnsJson = await dnsRes.json();
                 if (dnsJson.Answer && dnsJson.Answer.length > 0) {
                     connectAddr = dnsJson.Answer[0].data;
@@ -3658,15 +4367,13 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
             await remoteSocket.opened;
         } catch {
             let pips = [];
-            if (activeProfile && activeProfile.proxyIp) {
-                pips = activeProfile.proxyIp.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+            if (activeProfile || sysConfig.backupRelay || sysConfig.customRelay) {
+                let nat64 = activeProfile ? getEffectiveNat64(activeProfile.nat64) : "";
+                pips = mergeRelayEntries([activeProfile ? activeProfile.proxyIp : null, sysConfig.backupRelay], nat64);
+                if (pips.length === 0) pips = mergeRelayEntries([sysConfig.customRelay], nat64);
             }
-            if (pips.length === 0 && sysConfig.backupRelay) {
-                pips = sysConfig.backupRelay.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
-            }
-            if (pips.length === 0 && sysConfig.customRelay) {
-                pips = sysConfig.customRelay.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
-            }
+
+            await loadRelayHealthSnapshot(env);
 
             // Consistent hash based on user/profile ID to prevent session/IP splitting across assets on Cloudflare
             let startIndex = 0;
@@ -3681,17 +4388,26 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
 
             // Attempt to connect with automatic failover to alternative proxy IPs
             let connected = false;
-            for (let attempt = 0; attempt < Math.min(pips.length, 3); attempt++) {
-                let currentIndex = (startIndex + attempt) % pips.length;
-                let currentProxy = pips[currentIndex];
+            let tryPips = filterQuarantinedRelays(pips);
+            if (tryPips.length === 0 && pips.length > 0) tryPips = pips;
+            for (let attempt = 0; attempt < Math.min(tryPips.length, RELAY_FAILOVER_MAX_ATTEMPTS); attempt++) {
+                let currentIndex = (startIndex + attempt) % tryPips.length;
+                let currentProxy = tryPips[currentIndex];
+                const rkFail = relayKeyOf(currentProxy);
                 try {
-                    const [altIP, altPortStr] = currentProxy.split(":");
-                    remoteSocket = connect({ hostname: altIP, port: altPortStr ? Number(altPortStr) : targetPort });
-                    await remoteSocket.opened;
+                    const [altIP0, altPortStr0] = currentProxy.split(":");
+                    const altPortClean = altPortStr0 ? altPortStr0.split("#")[0].trim() : altPortStr0;
+                    const altIP = rkFail && rkFail.host ? rkFail.host : altIP0;
+                    remoteSocket = connect({ hostname: altIP, port: altPortClean ? Number(altPortClean) : targetPort });
+                    await withTimeout(remoteSocket.opened, RELAY_OPEN_TIMEOUT_MS, "relay-open");
                     connected = true;
+                    relayConfirmed = false;
+                    activeRelay = rkFail ? { host: rkFail.host, port: rkFail.port } : null;
                     break;
                 } catch (e) {
-                    // Try next fallback proxy IP in list
+                    if (rkFail) {
+                        try { recordRelayFailure(rkFail.host, rkFail.port); } catch (ee) {}
+                    }
                 }
             }
             if (!connected) {
@@ -3704,13 +4420,627 @@ async function startDataPipe(webSocket, env, ctx, wsRelayIdx) {
         if (offset < bufferData.byteLength) {
             let chunk = bufferData.slice(offset);
             await dataWriter.write(chunk);
+            connBytesUp += chunk.byteLength;
         }
-        remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) { 
-            webSocket.send(chunk); 
+        remoteSocket.readable.pipeTo(new WritableStream({ write(chunk) {
+            connBytesDown += chunk?.byteLength || 0;
+            flushUsage();
+            if (activeRelay && !relayConfirmed && chunk && chunk.byteLength > 0) {
+                relayConfirmed = true;
+                try { recordRelaySuccess(activeRelay.host, activeRelay.port, true); } catch (e) {}
+            }
+            webSocket.send(chunk);
         } }));
 
         return isModeAlpha;
     }
+}
+
+function relayKeyOf(tok) {
+    try {
+        let s = String(tok || "").trim();
+        if (!s) return null;
+        s = s.replace(/^[a-zA-Z]+:\/\//, "");
+        if (s.includes("@")) s = s.substring(s.lastIndexOf("@") + 1);
+        const hi = s.indexOf("#");
+        if (hi !== -1) s = s.substring(0, hi).trim();
+        if (!s) return null;
+        if (s.charAt(0) === "[") {
+            const ci = s.indexOf("]");
+            if (ci === -1) return null;
+            const host = s.substring(1, ci).toLowerCase();
+            let port = 443;
+            if (s.length > ci + 1 && s.charAt(ci + 1) === ":") {
+                const p = parseInt(s.substring(ci + 2), 10);
+                if (!isNaN(p) && p >= 1 && p <= 65535) port = p;
+            }
+            if (!host) return null;
+            return { host, port, key: host + "|" + port };
+        }
+        const firstColon = s.indexOf(":");
+        const lastColon = s.lastIndexOf(":");
+        if (firstColon !== -1 && firstColon !== lastColon) {
+            const host = s.toLowerCase();
+            if (!host || host.length > 253) return null;
+            return { host, port: 443, key: host + "|443" };
+        }
+        let host = s;
+        let port = 443;
+        if (lastColon !== -1) {
+            const tail = s.substring(lastColon + 1).trim();
+            if (/^\d+$/.test(tail)) {
+                const p = parseInt(tail, 10);
+                if (!isNaN(p) && p >= 1 && p <= 65535) {
+                    host = s.substring(0, lastColon);
+                    port = p;
+                } else {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+        host = host.toLowerCase();
+        if (!host || host.length > 253) return null;
+        if (!/^[a-z0-9.\-]+$/.test(host)) return null;
+        return { host, port, key: host + "|" + port };
+    } catch (e) {
+        return null;
+    }
+}
+
+function isRelayQuarantined(host, port) {
+    try {
+        const k = String(host || "").toLowerCase() + "|" + (port || 443);
+        const e = RELAY_Q.get(k);
+        if (!e || !e.until) return false;
+        if (Date.now() > e.until) {
+            RELAY_Q.delete(k);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        return false;
+    }
+}
+
+function recordRelaySuccess(host, port, full) {
+    try {
+        const k = String(host || "").toLowerCase() + "|" + (port || 443);
+        const e = RELAY_Q.get(k);
+        if (!e) return;
+        e.fail = 0;
+        if (full) {
+            e.probeFail = 0;
+            e.until = 0;
+            if (!e.fail && !e.probeFail) RELAY_Q.delete(k);
+        }
+    } catch (err) {}
+}
+
+function recordRelayFailure(host, port) {
+    try {
+        const k = String(host || "").toLowerCase() + "|" + (port || 443);
+        let e = RELAY_Q.get(k);
+        if (!e) {
+            e = { fail: 0, until: 0, probeFail: 0 };
+            RELAY_Q.set(k, e);
+        }
+        e.fail = (e.fail || 0) + 1;
+        if (e.fail >= RELAY_FAIL_STREAK) {
+            const alreadyOut = e.until && e.until > Date.now();
+            e.until = Date.now() + RELAY_QUARANTINE_MS;
+            if (!alreadyOut) {
+                try { console.error("relay-quarantined: " + k + " (" + e.fail + " fails)"); } catch (err) {}
+            }
+        }
+        if (RELAY_Q.size > 2000) RELAY_Q.clear();
+    } catch (err) {}
+}
+
+function filterQuarantinedRelays(list) {
+    try {
+        return (list || []).filter((t) => {
+            const rk = relayKeyOf(t);
+            if (!rk) return true;
+            return !isRelayQuarantined(rk.host, rk.port);
+        });
+    } catch (e) {
+        return [];
+    }
+}
+
+function relayAutomationOff() {
+    try {
+        const v = sysConfig.autoPruneRelays;
+        if (v === undefined || v === null) return false;
+        const s = String(v).trim().toLowerCase();
+        return s === "0" || s === "off" || s === "no" || s === "false";
+    } catch (e) {
+        return false;
+    }
+}
+
+function collectRelayInventory() {
+    const out = new Map();
+    const addRaw = (raw) => {
+        try {
+            String(raw || "").split(/[\r\n,;]+/).forEach((t) => {
+                const rk = relayKeyOf(t);
+                if (rk && !out.has(rk.key)) out.set(rk.key, { host: rk.host, port: rk.port });
+            });
+        } catch (e) {}
+    };
+    try {
+        addRaw(sysConfig.backupRelay);
+        addRaw(sysConfig.customRelay);
+        (sysConfig.users || []).forEach((u) => {
+            try { addRaw(u.proxyIp); } catch (e) {}
+        });
+    } catch (e) {}
+    return Array.from(out.values());
+}
+
+function buildProbeHello(sni) {
+    try {
+        const sn = new TextEncoder().encode(String(sni || "cloudflare-dns.com")).slice(0, 64);
+        const rnd = new Uint8Array(32);
+        try { crypto.getRandomValues(rnd); } catch (e) {}
+        const body = [0x03, 0x03];
+        for (let i = 0; i < 32; i++) body.push(rnd[i]);
+        body.push(0x00);
+        const cs = [0xc0, 0x2b, 0xc0, 0x2f, 0xcc, 0xa8, 0xc0, 0x13];
+        body.push((cs.length >> 8) & 0xff, cs.length & 0xff);
+        for (const b of cs) body.push(b);
+        body.push(0x01, 0x00);
+        const ext = [0x00, 0x00];
+        const namePart = [0x00, (sn.length >> 8) & 0xff, sn.length & 0xff];
+        for (let i = 0; i < sn.length; i++) namePart.push(sn[i]);
+        const entry = [(namePart.length >> 8) & 0xff, namePart.length & 0xff].concat(namePart);
+        const extBlock = [(entry.length >> 8) & 0xff, entry.length & 0xff].concat(entry);
+        for (const b of extBlock) ext.push(b);
+        const extraExts = [
+            0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17,
+            0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,
+            0x00, 0x0d, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
+        ];
+        for (const b of extraExts) ext.push(b);
+        body.push((ext.length >> 8) & 0xff, ext.length & 0xff);
+        for (const b of ext) body.push(b);
+        const out = [0x16, 0x03, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+        out[3] = ((body.length + 4) >> 8) & 0xff;
+        out[4] = (body.length + 4) & 0xff;
+        out[6] = (body.length >> 16) & 0xff;
+        out[7] = (body.length >> 8) & 0xff;
+        out[8] = body.length & 0xff;
+        return new Uint8Array(out.concat(body));
+    } catch (e) {
+        return null;
+    }
+}
+
+async function probeRelayOnce(host, port, timeoutMs) {
+    let sock = null;
+    const pm = timeoutMs > 0 ? timeoutMs : RELAY_PROBE_TIMEOUT_MS;
+    try {
+        const probePort = port || 443;
+        sock = connect({ hostname: host, port: probePort });
+        await withTimeout(sock.opened, pm, "probe-timeout");
+        if (!RELAY_TLS_PORTS.has(String(probePort))) return true;
+        const hello = buildProbeHello("cloudflare-dns.com");
+        if (!hello) return false;
+        const writer = sock.writable.getWriter();
+        try {
+            await withTimeout(writer.write(hello), pm, "probe-timeout");
+        } finally {
+            try { writer.releaseLock(); } catch (e) {}
+        }
+        const reader = sock.readable.getReader();
+        try {
+            const res = await withTimeout(reader.read(), pm, "probe-timeout");
+            if (!res || res.done || !res.value) return false;
+            const b = new Uint8Array(res.value);
+            return b.length >= 2 && b[0] === 0x16 && b[1] === 0x03;
+        } finally {
+            try { reader.releaseLock(); } catch (e) {}
+        }
+    } catch (e) {
+        return false;
+    } finally {
+        try { if (sock) sock.close(); } catch (e) {}
+    }
+}
+
+async function probeRelayVerdict(host, port) {
+    try {
+        if (await probeRelayOnce(host, port, RELAY_PROBE_TIMEOUT_MS)) return true;
+    } catch (e) {}
+    try {
+        return await probeRelayOnce(host, port, RELAY_PROBE_RETRY_TIMEOUT_MS);
+    } catch (e) {
+        return false;
+    }
+}
+
+async function loadRelayHealthSnapshot(env) {
+    try {
+        if (relaySnapshotLoaded) return;
+        if (RELAY_Q.size > 0) {
+            relaySnapshotLoaded = true;
+            return;
+        }
+        const raw = await d1Get(env, "relay_health");
+        relaySnapshotLoaded = true;
+        if (!raw) return;
+        const snap = JSON.parse(raw);
+        const now = Date.now();
+        const q = snap.q || {};
+        for (const k of Object.keys(q)) {
+            if (q[k] && q[k] > now && RELAY_Q.size < 2000) RELAY_Q.set(k, { fail: 0, until: q[k], probeFail: 0 });
+        }
+    } catch (e) { relaySnapshotLoaded = true; }
+}
+
+async function saveRelayHealthSnapshot(env) {
+    try {
+        if (Date.now() - lastHealthSave < PROBE_INTERVAL_MS) return;
+        lastHealthSave = Date.now();
+        const q = {};
+        let active = 0;
+        for (const [k, v] of RELAY_Q.entries()) {
+            if (v && v.until && v.until > Date.now()) {
+                q[k] = v.until;
+                active++;
+            }
+        }
+        if (active > 0) {
+            const entries = Object.entries(q).sort((a, b) => a[1] - b[1]);
+            let payload = JSON.stringify({ q });
+            while (payload.length > RELAY_HEALTH_MAX_CHARS && entries.length > 0) {
+                delete q[entries.shift()[0]];
+                payload = JSON.stringify({ q });
+            }
+            if (payload.length > RELAY_HEALTH_MAX_CHARS) return;
+            await d1Put(env, "relay_health", payload);
+        } else {
+            await d1Put(env, "relay_health", "{}");
+        }
+    } catch (e) {}
+}
+
+async function probeDeadRelays(env) {
+    try {
+        if (relayAutomationOff()) return;
+        if (!env || !env.IOT_DB) return;
+        const now = Date.now();
+        if (now - lastProbeTs < PROBE_INTERVAL_MS) return;
+        await loadRelayHealthSnapshot(env);
+        const inv = collectRelayInventory();
+        if (inv.length === 0) return;
+        const lastRun = Number(await d1Get(env, "swim_runner_probe")) || 0;
+        if (now - lastRun < PROBE_INTERVAL_MS) return;
+        lastProbeTs = now;
+        await d1Put(env, "swim_runner_probe", String(now));
+        const scored = inv
+            .map((r) => {
+                const e = RELAY_Q.get(r.host + "|" + r.port);
+                return { r, pf: (e && e.probeFail) || 0 };
+            })
+            .sort((a, b) => b.pf - a.pf || (a.r.host < b.r.host ? -1 : 1));
+        let probeCap = PROBE_MAX_PER_ROUND;
+        if (scored.length > 0) {
+            const stored = Number(await d1Get(env, "swim_runner_probe_cursor"));
+            if (Number.isFinite(stored) && stored >= 0) probeCursor = Math.floor(stored) % scored.length;
+        }
+        const rotated = [];
+        for (let i = 0; i < scored.length; i++) rotated.push(scored[(probeCursor + i) % scored.length]);
+        probeCursor = (probeCursor + probeCap) % scored.length;
+        await d1Put(env, "swim_runner_probe_cursor", String(probeCursor));
+        const picked = rotated.slice(0, probeCap);
+        const results = await Promise.all(picked.map(async ({ r }) => {
+            let ok = false;
+            try { ok = await probeRelayVerdict(r.host, r.port); } catch (e) { ok = false; }
+            return { r, ok };
+        }));
+        for (const { r } of results.filter((x) => x.ok)) recordRelaySuccess(r.host, r.port, true);
+        for (const { r } of results.filter((x) => !x.ok)) {
+            const k = r.host + "|" + r.port;
+            let e = RELAY_Q.get(k);
+            if (!e) {
+                e = { fail: 0, until: 0, probeFail: 0 };
+                RELAY_Q.set(k, e);
+            }
+            e.probeFail = (e.probeFail || 0) + 1;
+            e.until = Date.now() + RELAY_PROBE_SKIP_MS;
+            if (e.probeFail >= PROBE_FAIL_LIMIT) {
+                try { await buryDeadRelay(env, r.host, r.port); } catch (err) {}
+            }
+        }
+        await saveRelayHealthSnapshot(env);
+    } catch (e) {}
+}
+
+function relayHealthSnapshot() {
+    const now = Date.now();
+    const out = { quarantined: [], graveyard: [] };
+    for (let [k, v] of RELAY_Q.entries()) {
+        if (v && v.until && v.until > now) out.quarantined.push(k);
+    }
+    return out;
+}
+
+async function relayHealthSnapshotAsync(env) {
+    const out = relayHealthSnapshot();
+    try {
+        if (env && env.IOT_DB) {
+            const g = JSON.parse((await d1Get(env, "relay_graveyard")) || "{}");
+            for (const [k, e] of Object.entries(g || {})) {
+                out.graveyard.push({
+                    key: k,
+                    streak: (e && e.healthyStreak) || 0,
+                    unstable: !!(e && e.unstable),
+                    lists: (e && e.lists && e.lists.length) || 0
+                });
+            }
+        }
+    } catch (e) {}
+    return out;
+}
+
+async function buryDeadRelay(env, host, port) {
+    try {
+        if (!env || !env.IOT_DB || !host) return false;
+        if (relayAutomationOff()) return false;
+        const hostLower = String(host).toLowerCase();
+        const portN = port || 443;
+        const deadKey = hostLower + "|" + portN;
+        const keyMatches = (tok) => {
+            try { const rk = relayKeyOf(tok); return !!rk && rk.key === deadKey; } catch (e) { return false; }
+        };
+        const scan = (raw) => {
+            const parts = String(raw || "").split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
+            const removed = parts.filter(keyMatches);
+            const kept = parts.filter((t) => !keyMatches(t));
+            return { kept, removed };
+        };
+        const lists = [];
+        const tokens = {};
+        const globalChanges = [];
+        const userChanges = [];
+        try {
+            for (const field of ["backupRelay", "customRelay"]) {
+                const raw = sysConfig[field] || "";
+                if (!raw || raw.toLowerCase().indexOf(hostLower) === -1) continue;
+                const { kept, removed } = scan(raw);
+                if (removed.length === 0) continue;
+                const lk = "global:" + field;
+                lists.push(lk);
+                tokens[lk] = removed;
+                globalChanges.push({ field, next: kept.join(",") });
+            }
+        } catch (e) {}
+        try {
+            for (const u of (sysConfig.users || [])) {
+                try {
+                    const raw = u.proxyIp || "";
+                    if (!raw || raw.toLowerCase().indexOf(hostLower) === -1) continue;
+                    const { kept, removed } = scan(raw);
+                    if (removed.length === 0) continue;
+                    if (kept.length === 0) continue;
+                    const lk = "user:" + (u.name || u.id);
+                    lists.push(lk);
+                    tokens[lk] = removed;
+                    userChanges.push({ u, next: kept.join(",") });
+                } catch (e) {}
+            }
+        } catch (e) {}
+        if (globalChanges.length === 0 && userChanges.length === 0) return false;
+        let g = {};
+        try { g = JSON.parse((await d1Get(env, "relay_graveyard")) || "{}"); } catch (e) { g = {}; }
+        const prev = g[deadKey] || {};
+        let flaps = [];
+        try {
+            const fm = JSON.parse((await d1Get(env, "relay_flaps")) || "{}");
+            flaps = Array.isArray(fm[deadKey]) ? fm[deadKey].filter((t) => Date.now() - t < FLAP_WINDOW_MS) : [];
+        } catch (e) { flaps = []; }
+        const allLists = Array.from(new Set([].concat(prev.lists || [], lists))).slice(0, 100);
+        const allTokens = { ...(prev.tokens || {}) };
+        for (const k of Object.keys(tokens)) {
+            allTokens[k] = Array.from(new Set([].concat(allTokens[k] || [], tokens[k]))).slice(0, 100);
+        }
+        const entry = {
+            host: hostLower,
+            port: portN,
+            buriedAt: Date.now(),
+            lists: allLists,
+            tokens: allTokens,
+            burials: (prev.burials || 0) + 1,
+            healthyStreak: 0,
+            unstable: flaps.length >= FLAP_LIMIT
+        };
+        g[deadKey] = entry;
+        const gk = Object.keys(g);
+        if (gk.length > GRAVE_MAX_ENTRIES) {
+            const candidates = gk.filter((k) => k !== deadKey);
+            candidates.sort((a, b) => ((g[a] && g[a].buriedAt) || 0) - ((g[b] && g[b].buriedAt) || 0));
+            for (const drop of candidates.slice(0, Math.max(0, gk.length - GRAVE_MAX_ENTRIES))) {
+                try { delete g[drop]; } catch (e) {}
+            }
+        }
+        let gravePayload = JSON.stringify(g);
+        if (gravePayload.length > GRAVE_MAX_CHARS) {
+            const ordered = Object.keys(g).filter((k) => k !== deadKey).sort((a, b) => ((g[a] && g[a].buriedAt) || 0) - ((g[b] && g[b].buriedAt) || 0));
+            for (const drop of ordered) {
+                delete g[drop];
+                gravePayload = JSON.stringify(g);
+                if (gravePayload.length <= GRAVE_MAX_CHARS) break;
+            }
+        }
+        if (gravePayload.length > GRAVE_MAX_CHARS) return false;
+        try {
+            await d1PutStrict(env, "relay_graveyard", gravePayload);
+        } catch (e) {
+            return false;
+        }
+        const prevGlobals = {};
+        const prevUsers = new Map();
+        try {
+            for (const c of globalChanges) prevGlobals[c.field] = sysConfig[c.field];
+            for (const c of userChanges) prevUsers.set(c.u, c.u.proxyIp);
+            for (const c of globalChanges) sysConfig[c.field] = c.next;
+            for (const c of userChanges) c.u.proxyIp = c.next;
+            await d1PutStrict(env, "sys_config", JSON.stringify(sysConfig));
+        } catch (e) {
+            try {
+                for (const k of Object.keys(prevGlobals)) sysConfig[k] = prevGlobals[k];
+                for (const [u, prevVal] of prevUsers) u.proxyIp = prevVal;
+            } catch (_) {}
+            return false;
+        }
+        try { console.error("relay-buried: " + deadKey + " from " + lists.join(",")); } catch (e) {}
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+async function resurrectRelay(env, key, entry) {
+    lastResurrectChanged = false;
+    try {
+        const host = String(entry.host || "").toLowerCase();
+        if (!host) return false;
+        const tokens = entry.tokens || {};
+        const prevVals = [];
+        let restoreChanged = false;
+        let failed = false;
+        const restore = () => {
+            for (let i = prevVals.length - 1; i >= 0; i--) {
+                try { prevVals[i].obj[prevVals[i].field] = prevVals[i].before; } catch (e) {}
+            }
+        };
+        for (const l of entry.lists || []) {
+            if (failed) break;
+            try {
+                const addToks = tokens[l] || [];
+                if (addToks.length === 0) continue;
+                const alreadyHas = (raw) => String(raw || "").split(/[\r\n,;]+/).some((t) => {
+                    try { const rk = relayKeyOf(t); return !!rk && rk.key === key; } catch (e) { return false; }
+                });
+                const apply = (raw) => {
+                    if (alreadyHas(raw)) return null;
+                    const parts = String(raw || "").split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
+                    return parts.concat(addToks).join(",");
+                };
+                let target = null;
+                let field = "proxyIp";
+                if (l === "global:backupRelay") { target = sysConfig; field = "backupRelay"; }
+                else if (l === "global:customRelay") { target = sysConfig; field = "customRelay"; }
+                else if (l.startsWith("user:")) {
+                    const nm = l.slice(5);
+                    target = (sysConfig.users || []).find((x) => x && (x.name === nm || x.id === nm)) || null;
+                }
+                if (!target) continue;
+                const after = apply(target[field]);
+                if (after === null) continue;
+                prevVals.push({ obj: target, field: field, before: target[field] });
+                target[field] = after;
+                restoreChanged = true;
+            } catch (e) {
+                failed = true;
+            }
+        }
+        if (failed) {
+            restore();
+            return false;
+        }
+        if (!restoreChanged) return true;
+        try {
+            await d1PutStrict(env, "sys_config", JSON.stringify(sysConfig));
+        } catch (e) {
+            restore();
+            return false;
+        }
+        lastResurrectChanged = true;
+        try { console.error("relay-resurrected: " + key); } catch (e) {}
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+async function probeGraveyard(env) {
+    try {
+        if (relayAutomationOff()) return;
+        if (!env || !env.IOT_DB) return;
+        const now = Date.now();
+        if (now - lastGraveTs < GRAVE_INTERVAL_MS) return;
+        const lastRun = Number(await d1Get(env, "swim_runner_grave")) || 0;
+        if (now - lastRun < GRAVE_INTERVAL_MS) return;
+        lastGraveTs = now;
+        await d1Put(env, "swim_runner_grave", String(now));
+        let g = {};
+        try { g = JSON.parse((await d1Get(env, "relay_graveyard")) || "{}"); } catch (e) { return; }
+        const keys = Object.keys(g).slice(0, 200);
+        keys.sort((a, b) => ((g[a] && g[a].buriedAt) || 0) - ((g[b] && g[b].buriedAt) || 0));
+        if (keys.length === 0) return;
+        try {
+            const stored = Number(await d1Get(env, "swim_runner_grave_cursor"));
+            if (Number.isFinite(stored) && stored >= 0) graveCursor = Math.floor(stored) % keys.length;
+        } catch (e) {}
+        const grotated = [];
+        for (let i = 0; i < keys.length; i++) grotated.push(keys[(graveCursor + i) % keys.length]);
+        const graveCap = GRAVE_MAX_PER_ROUND;
+        graveCursor = (graveCursor + graveCap) % keys.length;
+        await d1Put(env, "swim_runner_grave_cursor", String(graveCursor));
+        const graveTargets = grotated.slice(0, graveCap);
+        const graveResults = await Promise.all(graveTargets.map(async (k) => {
+            const entry = g[k];
+            if (!entry || !entry.host) return { k, ok: null };
+            let ok = false;
+            try { ok = await probeRelayVerdict(entry.host, entry.port || 443); } catch (e) { ok = false; }
+            return { k, ok };
+        }));
+        let dirty = false;
+        for (const { k, ok } of graveResults) {
+            const entry = g[k];
+            if (!entry || !entry.host) {
+                delete g[k];
+                dirty = true;
+                continue;
+            }
+            if (ok === null) continue;
+            if (ok) {
+                entry.healthyStreak = (entry.healthyStreak || 0) + 1;
+                if (entry.healthyStreak >= GRAVE_HEALTHY_NEED) {
+                    let okR = false;
+                    try { okR = await resurrectRelay(env, k, entry); } catch (e) { okR = false; }
+                    if (!okR) {
+                        entry.healthyStreak = 0;
+                        dirty = true;
+                        continue;
+                    }
+                    if (lastResurrectChanged) {
+                        try {
+                            const fm = JSON.parse((await d1Get(env, "relay_flaps")) || "{}");
+                            const arr = Array.isArray(fm[k]) ? fm[k] : [];
+                            arr.push(Date.now());
+                            fm[k] = arr.filter((t) => Date.now() - t < FLAP_WINDOW_MS).slice(-10);
+                            await d1Put(env, "relay_flaps", JSON.stringify(fm));
+                        } catch (e) {}
+                    }
+                    recordRelaySuccess(entry.host, entry.port || 443, true);
+                    delete g[k];
+                    dirty = true;
+                } else {
+                    dirty = true;
+                }
+            } else {
+                entry.healthyStreak = 0;
+                dirty = true;
+            }
+        }
+        if (dirty) await d1Put(env, "relay_graveyard", JSON.stringify(g));
+    } catch (e) {}
 }
 
 function generateHardwareId(seed) {
@@ -3744,10 +5074,9 @@ function getSubscriptionStats(targetSub = null) {
     
     let idClean = id.replace(/-/g, '').toLowerCase();
     let sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0 };
-    let totalReqs = sysU.reqs || 0;
-    
-    let totalGb = (totalReqs / 6000).toFixed(2);
-    let limitTotalGb = limitTotalReq ? (limitTotalReq / 6000).toFixed(2) : 'Unlimited';
+
+    let totalGb = (usageTotalBytes(sysU) / 1073741824).toFixed(2);
+    let limitTotalGb = limitTotalReq ? (limitReqToBytes(limitTotalReq) / 1073741824).toFixed(2) : 'Unlimited';
     
     let expiryDateTxt = 'Never Expire';
     let remDaysTxt = 'Never Expire';
@@ -3807,14 +5136,13 @@ function getAllProfiles(targetSub = null) {
             if (u.expiryMs && now > u.expiryMs) skip = true;
             if (u.isPaused) skip = true;
             if (u.limitTotalReq && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
-                if (sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()].reqs >= u.limitTotalReq) skip = true;
+                if (usageTotalBytes(sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) >= limitReqToBytes(u.limitTotalReq)) skip = true;
             }
             if (u.limitDailyReq && sysUsageCache && sysUsageCache.users && sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) {
-                let usr = sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()];
-                if (usr.lastDay === new Date().toISOString().split('T')[0] && usr.dReqs >= u.limitDailyReq) skip = true;
+                if (usageDailyBytes(sysUsageCache.users[u.id.replace(/-/g, '').toLowerCase()]) >= limitReqToBytes(u.limitDailyReq)) skip = true;
             }
             if(!skip) {
-                list.push({ id: u.id, name: u.name, customName: u.customName || null, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, proxyIpGeo: u.proxyIpGeo || null, userNodes: u.userNodes || null, nat64: u.nat64 || null, connLimit: u.connLimit || null, userPanelUrl: u.userPanelUrl || null });
+                list.push({ id: u.id, name: u.name, customName: u.customName || null, proxyIp: u.proxyIp, cleanIp: u.cleanIp || null, userMode: u.userMode || null, userPorts: u.userPorts || null, maxConfigs: u.maxConfigs || null, proxyIpGeo: u.proxyIpGeo || null, userNodes: u.userNodes || null, nat64: u.nat64 || null, connLimit: u.connLimit || null, userPanelUrl: u.userPanelUrl || null, segMode: u.segMode || null, segPackets: u.segPackets || null, segLengths: u.segLengths || null, segDelays: u.segDelays || null, segMaxSplit: u.segMaxSplit || null, segManual: u.segManual || null, tlsMask: u.tlsMask || null });
                 registerConfigEntry(u.id, u.id, u.proxyIp || '');
             }
         });
@@ -3850,22 +5178,6 @@ function getGlobalNodeHosts() {
     return [...new Set(hosts)];
 }
 
-function buildSingleUri(hostName) {
-    let allHostNames = [hostName];
-    allHostNames.push(...getGlobalNodeHosts());
-    let finalHost = allHostNames[0];
-    let finalIP = getCleanIps(finalHost)[0];
-    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
-    let firstPort = ports[0];
-    let sec = getTransportParams(firstPort);
-    let reqPath = encodeURI(`/${sysConfig.apiRoute}`);
-    let uriProto = sysConfig.mode === "beta" ? getBeta() : getAlpha();
-    let ext = `encryption=none&security=${sec}&sni=${finalHost}&fp=${sysConfig.agent}&type=ws&host=${finalHost}&path=${reqPath}`;
-    if (sysConfig.enableOpt2) ext += `&pbk=enabled`;
-    return `${uriProto}://${activeDeviceId}@${finalIP}:${firstPort}?${ext}#${finalHost}`;
-}
-
-
 function getProxyIpsArray(proxyIpString) {
     if (!proxyIpString) return [];
     return proxyIpString.split(/[\r\n,;]+/).map(s => {
@@ -3890,17 +5202,37 @@ function ipv4ToNat64(ipv4, prefix) {
     return prefix.replace(/\/\d+$/, '').replace(/:$/, '') + '::' + suffix;
 }
 
+function splitRelayEntries(raw) {
+    if (!raw) return [];
+    return String(raw).split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+}
+
+function mergeRelayEntries(lists, nat64Prefix) {
+    let seen = new Set();
+    let out = [];
+    lists.forEach(raw => {
+        getProxyIpsWithNat64(raw, nat64Prefix).forEach(tok => {
+            const rk = relayKeyOf(tok);
+            const key = rk ? rk.key : tok;
+            if (seen.has(key)) return;
+            seen.add(key);
+            out.push(tok);
+        });
+    });
+    return out;
+}
+
 function getProxyIpsWithNat64(proxyIpString, nat64Prefix) {
-    let ips = getProxyIpsArray(proxyIpString);
+    let ips = splitRelayEntries(proxyIpString);
     if (nat64Prefix) {
-        let prefixes = nat64Prefix.split(/[\r\n,;]+/).map(s => s.trim()).filter(Boolean);
+        let prefixes = splitRelayEntries(nat64Prefix);
         let nat64Ips = [];
         prefixes.forEach(prefix => {
-            ips.forEach(ip => {
-                if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
-                    let nat64 = ipv4ToNat64(ip, prefix);
-                    if (nat64) nat64Ips.push(nat64);
-                }
+            ips.forEach(tok => {
+                const rk = relayKeyOf(tok);
+                if (!rk || !/^\d{1,3}(\.\d{1,3}){3}$/.test(rk.host)) return;
+                let nat64 = ipv4ToNat64(rk.host, prefix);
+                if (nat64) nat64Ips.push(rk.port && rk.port !== 443 ? nat64 + ":" + rk.port : nat64);
             });
         });
         ips = ips.concat(nat64Ips);
@@ -3948,7 +5280,7 @@ async function preloadIpFlags(profiles, hostNames) {
             return { query: clean, fields: 'status,country,countryCode,city,isp,org' };
         });
         try {
-            const res = await fetch('http://ip-api.com/batch?fields=status,country,countryCode,city,isp,org', {
+            const res = await fetchT('http://ip-api.com/batch?fields=status,country,countryCode,city,isp,org', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(queries)
@@ -3979,13 +5311,6 @@ async function preloadIpFlags(profiles, hostNames) {
     }
 }
 
-function getEmojiFlag(ip) {
-    if (!ip) return "🌐";
-    let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
-    let geo = ipGeoCache.get(ip) || ipGeoCache.get(clean);
-    return geo ? geo.flag : "🌐";
-}
-
 function getGeoInfo(ip) {
     if (!ip) return { flag: '🌐', country: 'Unknown', countryCode: '', city: '', isp: '' };
     let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
@@ -3996,7 +5321,7 @@ async function fetchIpGeoData(ip) {
     if (!ip) return null;
     let clean = ip.split(':')[0].replace(/[\[\]]/g, '').split('#')[0].trim();
     try {
-        const res = await fetch(`http://ip-api.com/json/${clean}?fields=status,country,countryCode,city,isp,org`);
+        const res = await fetchT(`http://ip-api.com/json/${clean}?fields=status,country,countryCode,city,isp,org`);
         const data = await res.json();
         if (data && data.status === 'success') {
             const codePoints = data.countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt());
@@ -4073,13 +5398,108 @@ function getConfigName(type, profileName, port, hostName, ip, proxyIp = null, co
     }
 }
 
-function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts) {
-    if (!maxCfg) return ips;
+function calcEffectiveIps(ips, maxCfg, effectiveMode, effectivePorts, hostCount, directEnabled) {
+    if (maxCfg === null || maxCfg === undefined) return ips;
+    if (!ips || ips.length === 0) return ips;
     let protoCount = effectiveMode === "both" ? 2 : 1;
-    let portCount = effectivePorts.length;
-    let multiplier = protoCount * portCount;
-    let neededIps = Math.max(1, Math.floor(maxCfg / multiplier));
+    let portCount = effectivePorts && effectivePorts.length ? effectivePorts.length : 1;
+    let hostCountEff = hostCount && hostCount > 0 ? hostCount : 1;
+    let directFactor = directEnabled ? 2 : 1;
+    let multiplier = hostCountEff * portCount * protoCount * directFactor;
+    let neededIps = Math.floor(maxCfg / multiplier);
+    if (neededIps < 1) return [];
     return ips.slice(0, neededIps);
+}
+
+function parseSegRangeList(s, maxItems) {
+    try {
+        const items = String(s || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, maxItems);
+        if (!items.length) return null;
+        for (const it of items) {
+            if (!/^\d{1,5}(-\d{1,5})?$/.test(it)) return null;
+        }
+        return items;
+    } catch (e) {
+        return null;
+    }
+}
+
+function resolveSegFragment(p) {
+    try {
+        if (!p) return null;
+        const mode = String(p.segMode || "off").toLowerCase();
+        if (mode === "builder") {
+            const packets = String(p.segPackets || "").trim().slice(0, 32);
+            if (!packets) return null;
+            if (packets !== "tlshello" && !/^\d{1,3}-\d{1,3}$/.test(packets)) return null;
+            const lengths = parseSegRangeList(p.segLengths, 8);
+            const delays = parseSegRangeList(p.segDelays, 8);
+            const maxSplit = String(p.segMaxSplit ?? "").trim();
+            if (!lengths || !delays) return null;
+            if (!/^\d{1,6}$/.test(maxSplit)) return null;
+            return { kind: "fm", value: { tcp: [{ type: "fragment", settings: { packets, lengths, delays, maxSplit } }] } };
+        }
+        if (mode === "manual") {
+            const raw = String(p.segManual || "").trim().slice(0, 4000);
+            if (!raw) return null;
+            if (raw.charAt(0) === "{") {
+                let obj = null;
+                try { obj = JSON.parse(raw); } catch (e) { return null; }
+                if (!obj || typeof obj !== "object" || !Array.isArray(obj.tcp) || obj.tcp.length === 0) return null;
+                return { kind: "fm", value: { tcp: obj.tcp } };
+            }
+            if (/^\d{1,5}-\d{1,5},\d{1,5}-\d{1,5},(tlshello|\d{1,3}-\d{1,3})$/.test(raw)) return { kind: "classic", value: raw };
+            return null;
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function buildSegFragmentParam(p) {
+    try {
+        const r = resolveSegFragment(p);
+        if (!r) return "";
+        if (r.kind === "fm") return "&fm=" + encodeURIComponent(JSON.stringify(r.value));
+        return "&fragment=" + encodeURIComponent(String(r.value));
+    } catch (e) {
+        return "";
+    }
+}
+
+function getSegStreamExtra(p) {
+    try {
+        const r = resolveSegFragment(p);
+        if (!r) return {};
+        if (r.kind === "fm") return { finalmask: r.value };
+        const m = String(r.value).split(",");
+        return { fragment: { packets: m[2], length: m[0], interval: m[1] } };
+    } catch (e) {
+        return {};
+    }
+}
+
+function buildTlsMaskParam(p) {
+    try {
+        if (!p || !p.tlsMask) return "";
+        const v = String(p.tlsMask).trim().slice(0, 2000);
+        if (!/^(TLS_[A-Za-z0-9_]+)(:TLS_[A-Za-z0-9_]+)*$/.test(v)) return "";
+        return "&cs=" + encodeURIComponent(v);
+    } catch (e) {
+        return "";
+    }
+}
+
+function isSegEnabled(p) {
+    try {
+        if (!p) return false;
+        const mode = String(p.segMode || "off").toLowerCase();
+        if (mode !== "builder" && mode !== "manual") return false;
+        return buildSegFragmentParam(p) !== "";
+    } catch (e) {
+        return false;
+    }
 }
 
 function getProfileHostNames(hostName, profile) {
@@ -4102,13 +5522,8 @@ function getEffectiveNat64(userNat64) {
 
 function getEffectivePips(p) {
     let effectiveNat64 = getEffectiveNat64(p.nat64);
-    let pips = getProxyIpsWithNat64(p.proxyIp, effectiveNat64);
-    if (pips.length === 0 && sysConfig.backupRelay) {
-        pips = getProxyIpsWithNat64(sysConfig.backupRelay, effectiveNat64);
-    }
-    if (pips.length === 0 && sysConfig.customRelay) {
-        pips = getProxyIpsWithNat64(sysConfig.customRelay, effectiveNat64);
-    }
+    let pips = mergeRelayEntries([p.proxyIp, sysConfig.backupRelay], effectiveNat64);
+    if (pips.length === 0) pips = mergeRelayEntries([sysConfig.customRelay], effectiveNat64);
     return pips;
 }
 
@@ -4132,6 +5547,7 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
+        if (maxCfg !== null) maxCfg = Math.max(0, maxCfg - fakeNames.length);
 
         let configIndex = 0;
         let profileHostNames = getProfileHostNames(hostName, p);
@@ -4139,7 +5555,7 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
         profileHostNames.forEach(hName => {
             let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
             let allIps = ipEntries.map(e => e.ip);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts, profileHostNames.length, !!(sysConfig.enableDirectConfigs && pips.length > 0));
             let ipNameMap = {};
             ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
             effectivePorts.forEach(port => {
@@ -4147,6 +5563,7 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
                 let extBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${reqPath}`;
                 if (sysConfig.enableOpt2) extBase += `&pbk=enabled`;
                 extBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
+                extBase += buildSegFragmentParam(p) + buildTlsMaskParam(p);
                 ips.forEach(ip => {
                     let selectedProxyIp = null;
                     if (pips.length > 0) {
@@ -4167,6 +5584,7 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
                         let trojanExtBase = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr)}`;
                         if (sysConfig.enableOpt2) trojanExtBase += `&pbk=enabled`;
                         trojanExtBase += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
+                        trojanExtBase += buildSegFragmentParam(p) + buildTlsMaskParam(p);
                         lines.push(`${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase}#${tName}`);
                     }
                     if (sysConfig.enableDirectConfigs && pips.length > 0) {
@@ -4185,6 +5603,7 @@ async function buildUriProfile(hostName, targetSub = null, allowInsecure = false
                             let trojanExtBase2 = `encryption=none&security=${sec}&sni=${hName}&fp=${sysConfig.agent}&type=ws&host=${hName}&path=${encodeURIComponent(pathStrTr2)}`;
                             if (sysConfig.enableOpt2) trojanExtBase2 += `&pbk=enabled`;
                             trojanExtBase2 += `&allowInsecure=${allowInsecure ? "1" : "0"}`;
+                        trojanExtBase2 += buildSegFragmentParam(p) + buildTlsMaskParam(p);
                             lines.push(`${getBeta()}://${p.id}@${ip}:${port}?${trojanExtBase2}#${dtName}`);
                         }
                     }
@@ -4235,6 +5654,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
+        if (maxCfg !== null) maxCfg = Math.max(0, maxCfg - fakeNames.length);
 
         let configIndex = 0;
         let profileHostNames = getProfileHostNames(hostName, p);
@@ -4242,7 +5662,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
         profileHostNames.forEach(hName => {
             let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
             let allIps = ipEntries.map(e => e.ip);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts, profileHostNames.length, !!(sysConfig.enableDirectConfigs && pips.length > 0));
             let ipNameMap = {};
             ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
             effectivePorts.forEach(port => {
@@ -4262,7 +5682,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                         let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
                         let configUuid = generateConfigUuid(p.id, configIndex);
                         registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
-                        proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                        proxies.push(`- name: "${vName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n  fragment: ${isSegEnabled(p) ? "true" : "false"}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                     }
                     if (effectiveMode === "beta" || effectiveMode === "both") {
                         let tName = getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName);
@@ -4271,7 +5691,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                         let randomJunkTr = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                         let payloadTr = { junk: randomJunkTr, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
                         let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
-                        proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                        proxies.push(`- name: "${tName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrTr}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n  fragment: ${isSegEnabled(p) ? "true" : "false"}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                     }
                     configIndex++;
                     if (sysConfig.enableDirectConfigs && pips.length > 0) {
@@ -4284,7 +5704,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                             let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
                             let configUuid = generateConfigUuid(p.id, dcIndex);
                             registerConfigEntry(configUuid, p.id, '');
-                            proxies.push(`- name: "${dvName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                            proxies.push(`- name: "${dvName}"\n  type: ${getAlpha()}\n  server: ${ip}\n  port: ${port}\n  uuid: ${configUuid}\n  udp: true\n  tls: ${sec}\n  servername: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrVl}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n  fragment: ${isSegEnabled(p) ? "true" : "false"}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                         }
                         if (effectiveMode === "beta" || effectiveMode === "both") {
                             let dtName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, dcIndex, ipName, p.customName));
@@ -4295,7 +5715,7 @@ async function buildYamlProfile(hostName, targetSub = null, allowInsecure = fals
                             let randomJunkDt = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
                             let payloadDt = { junk: randomJunkDt, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: dcIndex };
                             let pathStrDt = "/" + btoa(JSON.stringify(payloadDt));
-                            proxies.push(`- name: "${dtName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrDt}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
+                            proxies.push(`- name: "${dtName}"\n  type: ${getBeta()}\n  server: ${ip}\n  port: ${port}\n  password: "${p.id}"\n  udp: true\n  tls: ${sec}\n  sni: ${hName}\n  client-fingerprint: ${sysConfig.agent || "random"}\n  network: ws\n  ws-opts:\n    path: "${pathStrDt}"\n    headers:\n      Host: ${hName}\n  skip-cert-verify: ${allowInsecure}\n  fragment: ${isSegEnabled(p) ? "true" : "false"}\n${sysConfig.enableOpt1 ? "  tfo: true" : ""}`);
                         }
                         configIndex++;
                     }
@@ -4404,12 +5824,6 @@ const k_obds = "out" + "bounds";
 const k_vl_mode = "vl" + "ess";
 const k_tr_mode = "tro" + "jan";
 
-function getIpTypeLabel(ip) {
-    if (ip.includes(":") || ip.includes("[")) return "IPv6";
-    if (/^[0-9.]+$/.test(ip)) return "IPv4";
-    return "Domain";
-}
-
 async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure = false) {
     let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
     let profiles = getAllProfiles(targetSub);
@@ -4458,6 +5872,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
+        if (maxCfg !== null) maxCfg = Math.max(0, maxCfg - fakeNames.length);
 
         let configIndex = 0;
         let profileHostNames = getProfileHostNames(hostName, p);
@@ -4465,7 +5880,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
         profileHostNames.forEach(hName => {
             let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
             let allIps = ipEntries.map(e => e.ip);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts, profileHostNames.length, !!(sysConfig.enableDirectConfigs && pips.length > 0));
             let ipNameMap = {};
             ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
             effectivePorts.forEach(port => {
@@ -4501,7 +5916,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                             "udp": true,
                             "uuid": configUuid,
                             "packet-encoding": "xudp",
-                            "tls": sec,
+                            "tls": isSegEnabled(p) ? { "enabled": sec, "fragment": true } : sec,
                             "servername": hName,
                             "client-fingerprint": sysConfig.agent || "random",
                             "skip-cert-verify": allowInsecure,
@@ -4547,7 +5962,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                             "udp": true,
                             "password": p.id,
                             "packet-encoding": "xudp",
-                            "tls": sec,
+                            "tls": isSegEnabled(p) ? { "enabled": sec, "fragment": true } : sec,
                             "sni": hName,
                             "client-fingerprint": sysConfig.agent || "random",
                             "skip-cert-verify": allowInsecure,
@@ -4580,7 +5995,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                             let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
                             let configUuid = generateConfigUuid(p.id, configIndex);
                             registerConfigEntry(configUuid, p.id, '');
-                            let ob = { "name": tagStr, "type": k_vl_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "uuid": configUuid, "packet-encoding": "xudp", "tls": sec, "servername": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrVl, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            let ob = { "name": tagStr, "type": k_vl_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "uuid": configUuid, "packet-encoding": "xudp", "tls": isSegEnabled(p) ? { "enabled": sec, "fragment": true } : sec, "servername": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrVl, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
                             if (sysConfig.enableOpt2) ob["ech-opts"] = { "enable": true, "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=" };
                             proxiesArr.push(ob);
                         }
@@ -4592,7 +6007,7 @@ async function buildClashJsonProfile(hostName, targetSub = null, allowInsecure =
                             let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
                             let configUuid2 = generateConfigUuid(p.id, configIndex);
                             registerConfigEntry(configUuid2, p.id, '');
-                            let ob = { "name": tagStr, "type": k_tr_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "password": p.id, "packet-encoding": "xudp", "tls": sec, "sni": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrTr, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            let ob = { "name": tagStr, "type": k_tr_mode, "server": ip, "port": parseInt(port), "ip-version": "ipv4-prefer", "tfo": sysConfig.enableOpt1 || false, "udp": true, "password": p.id, "packet-encoding": "xudp", "tls": isSegEnabled(p) ? { "enabled": sec, "fragment": true } : sec, "sni": hName, "client-fingerprint": sysConfig.agent || "random", "skip-cert-verify": allowInsecure, "alpn": ["http/1.1"], "network": "ws", "ws-opts": { "path": pathStrTr, "max-early-data": 2560, "early-data-header-name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
                             if (sysConfig.enableOpt2) ob["ech-opts"] = { "enable": true, "config": "AEX+DQBBTwAgACCfCTo0YCUiDF1bGU9Z72l8Bs1gVxt6D6FefjfzaJHcfwAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=" };
                             proxiesArr.push(ob);
                         }
@@ -4769,6 +6184,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
         let effectiveMode = p.userMode || sysConfig.mode;
         let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
         let maxCfg = p.maxConfigs || null;
+        if (maxCfg !== null) maxCfg = Math.max(0, maxCfg - fakeNames.length);
 
         let configIndex = 0;
         let profileHostNames = getProfileHostNames(hostName, p);
@@ -4776,7 +6192,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
         profileHostNames.forEach(hName => {
             let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
             let allIps = ipEntries.map(e => e.ip);
-            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts);
+            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts, profileHostNames.length, !!(sysConfig.enableDirectConfigs && pips.length > 0));
             let ipNameMap = {};
             ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
             effectivePorts.forEach(port => {
@@ -4815,6 +6231,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                                 "enabled": sec,
                                 "server_name": hName,
                                 "insecure": allowInsecure,
+                                ...(isSegEnabled(p) ? { "fragment": true } : {}),
                                 "alpn": ["http/1.1"],
                                 "utls": {
                                     "enabled": true,
@@ -4858,6 +6275,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                                 "enabled": sec,
                                 "server_name": hName,
                                 "insecure": allowInsecure,
+                                ...(isSegEnabled(p) ? { "fragment": true } : {}),
                                 "alpn": ["http/1.1"],
                                 "utls": {
                                     "enabled": true,
@@ -4886,7 +6304,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                             let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
                             let configUuid = generateConfigUuid(p.id, configIndex);
                             registerConfigEntry(configUuid, p.id, '');
-                            let ob = { "type": k_vl_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "uuid": configUuid, "packet_encoding": "xudp", "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrVl, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            let ob = { "type": k_vl_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "uuid": configUuid, "packet_encoding": "xudp", "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, ...(isSegEnabled(p) ? { "fragment": true } : {}), "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrVl, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
                             outboundsArr.push(ob);
                         }
                         if (isTrojan) {
@@ -4897,7 +6315,7 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                             let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
                             let configUuid2 = generateConfigUuid(p.id, configIndex);
                             registerConfigEntry(configUuid2, p.id, '');
-                            let ob = { "type": k_tr_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "password": p.id, "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrTr, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
+                            let ob = { "type": k_tr_mode, "tag": tagStr, "server": ip, "server_port": parseInt(port), "tcp_fast_open": sysConfig.enableOpt1 || false, "password": p.id, "network": "tcp", "tls": { "enabled": sec, "server_name": hName, "insecure": allowInsecure, ...(isSegEnabled(p) ? { "fragment": true } : {}), "alpn": ["http/1.1"], "utls": { "enabled": true, "fingerprint": "randomized" } }, "transport": { "type": "ws", "path": pathStrTr, "max_early_data": 2560, "early_data_header_name": "Sec-WebSocket-Protocol", "headers": { "Host": hName } } };
                             outboundsArr.push(ob);
                         }
                         configIndex++;
@@ -5093,6 +6511,216 @@ async function buildSingBoxJsonProfile(hostName, targetSub = null, allowInsecure
                 "external_ui_download_url": "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
                 "external_ui_download_detour": "direct"
             }
+        }
+    };
+}
+
+async function buildVJsonProfile(hostName, targetSub = null, allowInsecure = false) {
+    let ports = sysConfig.socketPorts ? sysConfig.socketPorts.split(',').map(s=>s.trim()).filter(Boolean) : ["443"];
+    let profiles = getAllProfiles(targetSub);
+    let allHostNames = [...new Set(profiles.flatMap(p => getProfileHostNames(hostName, p)))];
+    await preloadIpFlags(profiles, allHostNames);
+
+    let outboundsArr = [];
+    let fakeArr = [];
+    let nameCounts = {};
+
+    let fakeNames = getFakeConfigNames(targetSub);
+    fakeNames.forEach(name => {
+        fakeArr.push({
+            "tag": name,
+            "protocol": k_tr_mode,
+            "settings": {
+                "servers": [{ "address": "127.0.0.1", "port": 80, "password": activeDeviceId }]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "none",
+                ...getSegStreamExtra(p)
+            }
+        });
+    });
+
+    const getUniqueName = (baseName) => {
+        if (!nameCounts[baseName]) {
+            nameCounts[baseName] = 1;
+            return baseName;
+        }
+        let counter = nameCounts[baseName];
+        let newName = `${baseName}-${counter}`;
+        while (nameCounts[newName]) {
+            counter++;
+            newName = `${baseName}-${counter}`;
+        }
+        nameCounts[baseName] = counter + 1;
+        nameCounts[newName] = 1;
+        return newName;
+    };
+
+    profiles.forEach(p => {
+        let pips = getEffectivePips(p);
+        let effectiveMode = p.userMode || sysConfig.mode;
+        let effectivePorts = p.userPorts ? p.userPorts.split(',').map(s=>s.trim()).filter(Boolean) : ports;
+        let maxCfg = p.maxConfigs || null;
+        if (maxCfg !== null) maxCfg = Math.max(0, maxCfg - fakeNames.length);
+
+        let configIndex = 0;
+        let profileHostNames = getProfileHostNames(hostName, p);
+
+        profileHostNames.forEach(hName => {
+            let ipEntries = getCleanIpsWithNames(hName, p.cleanIp);
+            let allIps = ipEntries.map(e => e.ip);
+            let ips = calcEffectiveIps(allIps, maxCfg, effectiveMode, effectivePorts, profileHostNames.length, !!(sysConfig.enableDirectConfigs && pips.length > 0));
+            let ipNameMap = {};
+            ipEntries.forEach(e => { ipNameMap[e.ip] = e.name; });
+            effectivePorts.forEach(port => {
+                let sec = getTransportParams(port) === "tls" ? "tls" : "none";
+                ips.forEach(ip => {
+                    let selectedProxyIp = null;
+                    if (pips.length > 0) {
+                        selectedProxyIp = pips[configIndex % pips.length];
+                    }
+                    let ipName = ipNameMap[ip] || '';
+                    if (effectiveMode === "alpha" || effectiveMode === "both") {
+                        let vName = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName));
+                        let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                        let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
+                        let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
+                        let configUuid = generateConfigUuid(p.id, configIndex);
+                        registerConfigEntry(configUuid, p.id, selectedProxyIp || '');
+                        outboundsArr.push({
+                            "tag": vName,
+                            "protocol": k_vl_mode,
+                            "settings": {
+                                "vnext": [{
+                                    "address": ip,
+                                    "port": parseInt(port),
+                                    "users": [{ "id": configUuid, "encryption": "none" }]
+                                }]
+                            },
+                            "streamSettings": {
+                                "network": "ws",
+                                "security": sec,
+                                ...getSegStreamExtra(p),
+                                "tlsSettings": sec === "tls" ? { "serverName": hName, "allowInsecure": allowInsecure, "fingerprint": sysConfig.agent || "chrome" } : undefined,
+                                "sockopt": sysConfig.enableOpt1 ? { "tcpFastOpen": true } : undefined,
+                                "wsSettings": { "path": pathStrVl, "headers": { "Host": hName } }
+                            }
+                        });
+                    }
+                    if (effectiveMode === "beta" || effectiveMode === "both") {
+                        let tName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, selectedProxyIp, configIndex, ipName, p.customName));
+                        let randomJunkTr = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                        let payloadTr = { junk: randomJunkTr, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: configIndex };
+                        let pathStrTr = "/" + btoa(JSON.stringify(payloadTr));
+                        outboundsArr.push({
+                            "tag": tName,
+                            "protocol": k_tr_mode,
+                            "settings": {
+                                "servers": [{ "address": ip, "port": parseInt(port), "password": p.id }]
+                            },
+                            "streamSettings": {
+                                "network": "ws",
+                                "security": sec,
+                                ...getSegStreamExtra(p),
+                                "tlsSettings": sec === "tls" ? { "serverName": hName, "allowInsecure": allowInsecure, "fingerprint": sysConfig.agent || "chrome" } : undefined,
+                                "sockopt": sysConfig.enableOpt1 ? { "tcpFastOpen": true } : undefined,
+                                "wsSettings": { "path": pathStrTr, "headers": { "Host": hName } }
+                            }
+                        });
+                    }
+                    configIndex++;
+                    if (sysConfig.enableDirectConfigs && pips.length > 0) {
+                        let dcIndex = configIndex;
+                        if (effectiveMode === "alpha" || effectiveMode === "both") {
+                            let dvName = getUniqueName(getConfigName("alpha", p.name, port, hName, ip, null, dcIndex, ipName, p.customName));
+                            let randomJunk = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                            let payloadVl = { junk: randomJunk, protocol: "vl", mode: "proxyip", panelIPs: [] };
+                            let pathStrVl = "/" + btoa(JSON.stringify(payloadVl));
+                            let configUuid = generateConfigUuid(p.id, dcIndex);
+                            registerConfigEntry(configUuid, p.id, '');
+                            outboundsArr.push({
+                                "tag": dvName,
+                                "protocol": k_vl_mode,
+                                "settings": {
+                                    "vnext": [{
+                                        "address": ip,
+                                        "port": parseInt(port),
+                                        "users": [{ "id": configUuid, "encryption": "none" }]
+                                    }]
+                                },
+                                "streamSettings": {
+                                    "network": "ws",
+                                    "security": sec,
+                                    ...getSegStreamExtra(p),
+                                    "tlsSettings": sec === "tls" ? { "serverName": hName, "allowInsecure": allowInsecure, "fingerprint": sysConfig.agent || "chrome" } : undefined,
+                                    "sockopt": sysConfig.enableOpt1 ? { "tcpFastOpen": true } : undefined,
+                                    "wsSettings": { "path": pathStrVl, "headers": { "Host": hName } }
+                                }
+                            });
+                        }
+                        if (effectiveMode === "beta" || effectiveMode === "both") {
+                            let dtName = getUniqueName(getConfigName("beta", p.name, port, hName, ip, null, dcIndex, ipName, p.customName));
+                            let randomJunkDt = Array.from({length: 11}, () => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]).join('');
+                            let payloadDt = { junk: randomJunkDt, protocol: "tr", mode: "proxyip", panelIPs: [], relayIdx: dcIndex };
+                            let pathStrDt = "/" + btoa(JSON.stringify(payloadDt));
+                            outboundsArr.push({
+                                "tag": dtName,
+                                "protocol": k_tr_mode,
+                                "settings": {
+                                    "servers": [{ "address": ip, "port": parseInt(port), "password": p.id }]
+                                },
+                                "streamSettings": {
+                                    "network": "ws",
+                                    "security": sec,
+                                    ...getSegStreamExtra(p),
+                                    "tlsSettings": sec === "tls" ? { "serverName": hName, "allowInsecure": allowInsecure, "fingerprint": sysConfig.agent || "chrome" } : undefined,
+                                    "sockopt": sysConfig.enableOpt1 ? { "tcpFastOpen": true } : undefined,
+                                    "wsSettings": { "path": pathStrDt, "headers": { "Host": hName } }
+                                }
+                            });
+                        }
+                        configIndex++;
+                    }
+                });
+            });
+        });
+    });
+
+    outboundsArr.push(...fakeArr);
+    outboundsArr.push({ "tag": "direct", "protocol": "freedom" });
+    outboundsArr.push({ "tag": "block", "protocol": "blackhole" });
+
+    return {
+        "log": { "loglevel": "warning" },
+        "inbounds": [
+            {
+                "tag": "socks-in",
+                "port": 10808,
+                "listen": "127.0.0.1",
+                "protocol": "socks",
+                "settings": { "auth": "noauth", "udp": true },
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+            },
+            {
+                "tag": "http-in",
+                "port": 10809,
+                "listen": "127.0.0.1",
+                "protocol": "http",
+                "settings": { "auth": "noauth" },
+                "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+            }
+        ],
+        [k_obds]: outboundsArr,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                { "type": "field", "outboundTag": "block", "protocol": ["bittorrent"] },
+                { "type": "field", "outboundTag": "direct", "ip": ["geoip:private"] },
+                { "type": "field", "outboundTag": "direct", "ip": ["geoip:cn"] },
+                { "type": "field", "outboundTag": "direct", "domain": ["geosite:cn"] }
+            ],
+            "strategy": "rules"
         }
     };
 }
@@ -5298,8 +6926,9 @@ function getDashboardUI(hasDB) {
           .user-bar-fill.amber { background: #fbbf24; }
           .user-bar-fill.red { background: #ef4444; }
           .user-actions { display: flex; gap: 4px; flex-wrap: wrap; }
-          .user-action { padding: 4px 8px; font-family: 'JetBrains Mono', monospace; font-size: 10px; border: 1px solid #222; background: transparent; color: #777; cursor: pointer; transition: all 0.1s; }
+          .user-action { padding: 7px 8px; font-family: 'JetBrains Mono', monospace; font-size: 10px; border: 1px solid #222; background: transparent; color: #777; cursor: pointer; transition: all 0.1s; white-space: nowrap; }
           .user-action:hover { border-color: #777; color: #777; }
+          .user-action.danger { color: #ef4444; border-color: rgba(239,68,68,0.35); }
           .user-action.danger:hover { border-color: #ef4444; color: #ef4444; }
 
           /* Override generated user card styles */
@@ -5809,16 +7438,29 @@ function getDashboardUI(hasDB) {
                                                <p class="text-[10px] text-slate-400" data-i18n="desc_format_normal">Standard _worker.js</p>
                                                </div>
                                            </label>
-                                           <label class="flex-1 flex items-center gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:border-emerald-400 transition-colors">
-                                               <input type="radio" name="auto-update-format" value="obfuscated" class="accent-emerald-500">
-                                               <div>
-                                               <span class="text-xs font-bold text-slate-700 dark:text-slate-300" data-i18n="format_obfuscated_label">Obfuscated</span>
-                                               <p class="text-[10px] text-slate-400" data-i18n="desc_format_obfuscated">XOR byte-shifting</p>
-                                               </div>
-                                           </label>
+                                            <label class="flex-1 flex items-center gap-2 p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-darkborder cursor-pointer hover:border-emerald-400 transition-colors">
+                                                <input type="radio" name="auto-update-format" value="obfuscated" class="accent-emerald-500">
+                                                <div>
+                                                <span class="text-xs font-bold text-slate-700 dark:text-slate-300" data-i18n="format_obfuscated_label">Obfuscated</span>
+                                                <p class="text-[10px] text-slate-400" data-i18n="desc_format_obfuscated">XOR byte-shifting</p>
+                                                </div>
+                                            </label>
                                        </div>
                                    </div>
+                                    <label class="flex items-center justify-between p-4" style="background:rgba(168,85,247,0.03);border:1px solid rgba(168,85,247,0.1)">
+                                        <div>
+                                            <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:#a855f7">Auto Prune Relays</span>
+                                            <p style="font-family:monospace;font-size:10px;opacity:0.5;margin-top:2px">Quarantine, bury and revive dead relays automatically</p>
+                                        </div>
+                                        <div class="toggle" style="position:relative;cursor:pointer" onclick="this.classList.toggle('on')">
+                                            <input type="checkbox" id="cfg-auto-prune" class="sr-only" style="display:none">
+                                            <div style="width:36px;height:20px;border-radius:10px;position:relative;transition:background 0.15s">
+                                                <div style="width:16px;height:16px;background:#444;border-radius:50%;position:absolute;top:2px;transition:all 0.15s" class="toggle-knob"></div>
+                                            </div>
+                                        </div>
+                                    </label>
                                 </div>
+
 
                                 <!-- API Keys Management -->
                                 <div class="bg-white dark:bg-darkcard rounded-3xl p-6 shadow-sm border border-slate-200 dark:border-darkborder md:col-span-2 space-y-4">
@@ -6208,7 +7850,7 @@ function getDashboardUI(hasDB) {
                                    </div>
                                </div>
                               <div class="overflow-x-auto">
-                                  <div id="tbl-users" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                                  <div id="tbl-users" class="grid grid-cols-1 gap-2">
                                   </div>
                               </div>
                           </div>
@@ -6417,12 +8059,51 @@ function getDashboardUI(hasDB) {
                                                <label class="block text-xs font-bold text-slate-500 mb-1.5">Ports</label>
                                                <div id="edit-user-ports-wrap" class="flex flex-wrap gap-2 mt-1"></div>
                                            </div>
-                                           <div>
-                                               <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_max_configs">Max Configs</label>
-                                               <input type="number" id="edit-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
-                                           </div>
-                                       </div>
-                                   </div>
+                                            <div>
+                                                <label class="block text-xs font-bold text-slate-500 mb-1.5" data-i18n="lbl_max_configs">Max Configs</label>
+                                                <input type="number" id="edit-user-max-configs" placeholder="Unlimited" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm" data-i18n-placeholder="unlimited">
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="space-y-4">
+                                        <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider">TLS Fragmentation & Mask</h4>
+                                        <div class="space-y-3">
+                                            <div>
+                                                <label class="block text-xs font-bold text-slate-500 mb-1.5">Segmentation Mode</label>
+                                                <select id="edit-user-seg-mode" onchange="toggleSegMode()" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                                    <option value="off">Off</option>
+                                                    <option value="builder">Builder (Auto)</option>
+                                                    <option value="manual">Manual</option>
+                                                </select>
+                                            </div>
+                                            <div id="edit-user-seg-builder-wrap" class="space-y-3 hidden">
+                                                <div>
+                                                    <label class="block text-xs font-bold text-slate-500 mb-1.5">Packets</label>
+                                                    <input type="text" id="edit-user-seg-packets" placeholder="tlshello or 1-10" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold text-slate-500 mb-1.5">Lengths</label>
+                                                    <input type="text" id="edit-user-seg-lengths" placeholder="e.g. 100-200,300-400" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold text-slate-500 mb-1.5">Delays</label>
+                                                    <input type="text" id="edit-user-seg-delays" placeholder="e.g. 10-20,30-40" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold text-slate-500 mb-1.5">Max Split</label>
+                                                    <input type="text" id="edit-user-seg-max-split" placeholder="e.g. 1000" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                                </div>
+                                            </div>
+                                            <div id="edit-user-seg-manual-wrap" class="hidden">
+                                                <label class="block text-xs font-bold text-slate-500 mb-1.5">Manual Fragment</label>
+                                                <input type="text" id="edit-user-seg-manual" placeholder="e.g. 0-10,10-20,tlshello" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-bold text-slate-500 mb-1.5">TLS Cipher Mask</label>
+                                                <input type="text" id="edit-user-tls-mask" placeholder="e.g. TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm font-mono">
+                                            </div>
+                                        </div>
+                                    </div>
                                </div>
                                <div class="px-5 py-4 border-t border-slate-200 dark:border-darkborder bg-white dark:bg-darkcard flex justify-between items-center shrink-0">
                                    <button onclick="closeEditUserPage()" class="px-5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-bold text-sm" data-i18n="btn_cancel">Cancel</button>
@@ -6866,11 +8547,6 @@ function getDashboardUI(hasDB) {
           } else {
               document.documentElement.classList.remove('dark');
           }
-  
-          function toggleTheme() {
-              document.documentElement.classList.toggle('dark');
-              localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light');
-          }
 
           function checkVersionPopup() {
               const popupKey = \`swimshady_shown_v\${CURRENT_VERSION}\`;
@@ -7246,6 +8922,12 @@ function getDashboardUI(hasDB) {
                   { name: "📅 {expiry}", enabled: true }
               ];
           }
+
+          function pruneOn(v) {
+              if (v === undefined || v === null) return true;
+              var s = String(v).trim().toLowerCase();
+              return !(v === false || v === 0 || s === '0' || s === 'off' || s === 'no' || s === 'false');
+          }
   
           // Export active page inputs configuration
           function exportConfig() {
@@ -7253,7 +8935,7 @@ function getDashboardUI(hasDB) {
               const payload = {
                   mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                   apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                   resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake') ? el('cfg-fake').value : '', backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, syncApiKey: el('cfg-sync-api-key') ? el('cfg-sync-api-key').value.trim() : '', autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
+                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake') ? el('cfg-fake').value : '', backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, syncApiKey: el('cfg-sync-api-key') ? el('cfg-sync-api-key').value.trim() : '', autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal', autoPruneRelays: el('cfg-auto-prune') ? el('cfg-auto-prune').checked : true,
                    enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                    tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                   cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -7311,6 +8993,7 @@ function getDashboardUI(hasDB) {
                       if (conf.silentAlerts !== undefined) document.getElementById('cfg-silent').checked = conf.silentAlerts;
                       mapId('cfg-nat64', conf.nat64Prefix);
                       if (conf.enableDirectConfigs !== undefined && document.getElementById('cfg-direct-configs')) document.getElementById('cfg-direct-configs').checked = conf.enableDirectConfigs;
+                      if (document.getElementById('cfg-auto-prune')) document.getElementById('cfg-auto-prune').checked = pruneOn(conf.autoPruneRelays);
                       if (document.getElementById('cfg-sync-api-key')) document.getElementById('cfg-sync-api-key').value = conf.syncApiKey || '';
                       if (conf.autoUpdate !== undefined && document.getElementById('cfg-auto-update')) {
                           document.getElementById('cfg-auto-update').checked = conf.autoUpdate;
@@ -7321,7 +9004,7 @@ function getDashboardUI(hasDB) {
                           const radio = document.querySelector(\`input[name="auto-update-format"][value="\${conf.autoUpdateFormat}"]\`);
                           if (radio) radio.checked = true;
                        }
-                       ['cfg-tfo','cfg-ech','cfg-pause','cfg-silent','cfg-direct-configs','cfg-auto-update'].forEach(id=>{const cb=document.getElementById(id);if(cb){const t=cb.closest('.toggle')||cb.parentElement;t.classList.toggle('on',cb.checked)}});
+                       ['cfg-tfo','cfg-ech','cfg-pause','cfg-silent','cfg-direct-configs','cfg-auto-update','cfg-auto-prune'].forEach(id=>{const cb=document.getElementById(id);if(cb){const t=cb.closest('.toggle')||cb.parentElement;t.classList.toggle('on',cb.checked)}});
                        
                        if (conf.fakeConfigs) renderFakeConfigs(conf.fakeConfigs);
                       if (conf.linkedPanels) {
@@ -7434,6 +9117,7 @@ function getDashboardUI(hasDB) {
                        document.getElementById('cfg-relay').value = conf.backupRelay || '';
                        if (document.getElementById('cfg-nat64')) document.getElementById('cfg-nat64').value = conf.nat64Prefix || '';
                        if (document.getElementById('cfg-direct-configs')) document.getElementById('cfg-direct-configs').checked = conf.enableDirectConfigs || false;
+                       if (document.getElementById('cfg-auto-prune')) document.getElementById('cfg-auto-prune').checked = pruneOn(conf.autoPruneRelays);
                        if (document.getElementById('cfg-sync-api-key')) document.getElementById('cfg-sync-api-key').value = conf.syncApiKey || '';
                        if (document.getElementById('cfg-auto-update')) {
                            document.getElementById('cfg-auto-update').checked = conf.autoUpdate || false;
@@ -7454,7 +9138,7 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-cf-worker').value = conf.cfWorkerName || '';
                       document.getElementById('cfg-pause').checked = conf.isPaused || false;
                        document.getElementById('cfg-silent').checked = conf.silentAlerts || false;
-                       ['cfg-tfo','cfg-ech','cfg-pause','cfg-silent','cfg-direct-configs','cfg-auto-update'].forEach(id=>{const cb=document.getElementById(id);if(cb){const t=cb.closest('.toggle')||cb.parentElement;t.classList.toggle('on',cb.checked)}});
+                       ['cfg-tfo','cfg-ech','cfg-pause','cfg-silent','cfg-direct-configs','cfg-auto-update','cfg-auto-prune'].forEach(id=>{const cb=document.getElementById(id);if(cb){const t=cb.closest('.toggle')||cb.parentElement;t.classList.toggle('on',cb.checked)}});
                        document.getElementById('cfg-github-repo').value = conf.githubRepo || 'Ceetherr/swimshady';
                       document.getElementById('cfg-name-strategy').value = conf.nameStrategy || 'default';
                       document.getElementById('cfg-name-prefix').value = conf.namePrefix || 'Core';
@@ -7472,14 +9156,15 @@ function getDashboardUI(hasDB) {
                       renderLinkedNodes();
                       renderProfiles();
                       updateDoHServerUrl();
-                      try { checkUpdate(); } catch(ue) { console.error(ue); }
+                       try { checkUpdate(); } catch(ue) { console.error(ue); }
+                       setInterval(() => { try { checkUpdate(); } catch(e) {} }, 5 * 60 * 1000);
                        if (!silent) switchTab('overview');
 
                       ['cfg-proto','cfg-port','cfg-fp','cfg-ips','cfg-path', 'cfg-relay', 'cfg-name-strategy', 'cfg-name-prefix', 'cfg-sub-ua', 'cfg-custom-panel-url'].forEach(id => {
                           const el = document.getElementById(id);
                           if(el) { el.addEventListener('input', updateUI); el.addEventListener('change', updateUI); }
                       });
-                       ['cfg-silent','cfg-pause','cfg-auto-update','cfg-direct-configs','cfg-tfo','cfg-ech'].forEach(id => {
+                       ['cfg-silent','cfg-pause','cfg-auto-update','cfg-auto-prune','cfg-direct-configs','cfg-tfo','cfg-ech'].forEach(id => {
                            const el = document.getElementById(id);
                            if(el) {
                                el.addEventListener('change', updateUI);
@@ -7547,7 +9232,7 @@ function getDashboardUI(hasDB) {
                               let use = data.usage[hash];
                               if(use) {
                                   let timeStr = new Date(use.last).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
-                                  usageHtml += \`<div class="flex items-center justify-between p-3 border-b border-slate-100 dark:border-darkborder/50 last:border-0"><div class="flex flex-col"><span class="text-sm font-bold text-slate-700 dark:text-slate-200">\${p.name}</span><span class="text-[10px] text-slate-400 font-mono">\${p.id.split('-')[0]}...</span></div><div class="flex flex-col items-end"><span class="text-xs font-bold text-emerald-500">\${use.connects} Conns</span><span class="text-[10px] text-slate-400">\${timeStr}</span></div></div>\`;
+                                  usageHtml += \`<div class="flex items-center justify-between p-3 border-b border-slate-100 dark:border-darkborder/50 last:border-0"><div class="flex flex-col"><span class="text-sm font-bold text-slate-700 dark:text-slate-200">\${p.name}</span><span class="text-[10px] text-slate-400 font-mono">\${p.id.split('-')[0]}...</span></div><div class="flex flex-col items-end"><span class="text-xs font-bold text-emerald-500">\${use.connects} Conns</span><span class="text-[10px] font-semibold text-slate-400">\${((use.bytes||0)/1073741824).toFixed(2)} GB</span><span class="text-[10px] text-slate-400">\${timeStr}</span></div></div>\`;
                               }
                           });
                           usageCont.innerHTML = usageHtml || '<p class="text-xs text-slate-400 text-center py-4">' + (i18n[lang]?.no_active_conn || 'No active connection data yet.') + '</p>';
@@ -7568,7 +9253,7 @@ function getDashboardUI(hasDB) {
                   config: {
                       mode: el('cfg-proto').value, socketPorts: Array.from(el('cfg-port').selectedOptions).map(o=>o.value).join(','), deviceId: el('cfg-uuid').value,
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
-                      resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake') ? el('cfg-fake').value : '', backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, syncApiKey: el('cfg-sync-api-key') ? el('cfg-sync-api-key').value.trim() : '', autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal',
+                   resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake') ? el('cfg-fake').value : '', backupRelay: el('cfg-relay').value, nat64Prefix: el('cfg-nat64') ? el('cfg-nat64').value : '', enableDirectConfigs: el('cfg-direct-configs') ? el('cfg-direct-configs').checked : false, syncApiKey: el('cfg-sync-api-key') ? el('cfg-sync-api-key').value.trim() : '', autoUpdate: el('cfg-auto-update') ? el('cfg-auto-update').checked : false, autoUpdateFormat: document.querySelector('input[name="auto-update-format"]:checked')?.value || 'normal', autoPruneRelays: el('cfg-auto-prune') ? el('cfg-auto-prune').checked : true,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
                       tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
@@ -7625,6 +9310,28 @@ function getDashboardUI(hasDB) {
 
           document.getElementById('pwd').addEventListener('keypress', e => { if (e.key === 'Enter') doLogin(); });
   
+          const REQ_BYTES_EST = 1073741824 / 6000;
+          function usageTotalBytes(u) {
+              try {
+                  if (!u) return 0;
+                  if (typeof u.bytes === 'number' && u.bytes >= 0) return Math.floor(u.bytes);
+                  return Math.floor((u.reqs || 0) * REQ_BYTES_EST);
+              } catch (e) { return 0; }
+          }
+          function usageDailyBytes(u, today) {
+              try {
+                  if (!u) return 0;
+                  const day = today || new Date().toISOString().split('T')[0];
+                  if ((u.lastDay || '') !== day) return 0;
+                  if (typeof u.dBytes === 'number' && u.dBytes >= 0) return Math.floor(u.dBytes);
+                  return Math.floor((u.dReqs || 0) * REQ_BYTES_EST);
+              } catch (e) { return 0; }
+          }
+          function limitReqToBytes(limitReq) {
+              try { return limitReq ? Math.floor(limitReq * REQ_BYTES_EST) : 0; }
+              catch (e) { return 0; }
+          }
+
           function renderUsersTable() {
               const tbl = document.getElementById('tbl-users');
               if(!tbl) return;
@@ -7637,12 +9344,12 @@ function getDashboardUI(hasDB) {
               let autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
               let pausedSubscribers = users.filter(u => u.isPaused && !u.disabledReason).length;
               let expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs && !u.isPaused).length;
-              let totalReqsSum = 0;
+              let totalBytesSum = 0;
               users.forEach(u => {
                   let sysU = usage[u.id.replace(/-/g,'').toLowerCase()] || {reqs: 0};
-                  totalReqsSum += (sysU.reqs || 0);
+                  totalBytesSum += usageTotalBytes(sysU);
               });
-              let totalGBSum = (totalReqsSum / 6000).toFixed(2);
+              let totalGBSum = (totalBytesSum / 1073741824).toFixed(2);
 
               // Update stats elements in DOM if they exist
               const totalUsersEl = document.getElementById('stat-total-users');
@@ -7712,31 +9419,36 @@ function getDashboardUI(hasDB) {
               let tblHtml = '';
               users.forEach((u, i) => {
                   let sysU = usage[u.id.replace(/-/g,'').toLowerCase()] || {reqs: 0, dReqs: 0, lastDay: ''};
-                  let userReqs = sysU.reqs || 0;
-                  let userDReqs = sysU.lastDay === new Date().toISOString().split('T')[0] ? (sysU.dReqs || 0) : 0;
+                  let userBytes = usageTotalBytes(sysU);
+                  let userDBytes = usageDailyBytes(sysU);
                   
                   const unlimitedTxt = lang === 'fa' ? 'نامحدود' : 'Unlimited';
                   let limitTotalTxt = u.limitTotalReq ? u.limitTotalReq : unlimitedTxt;
                   let limitDailyTxt = u.limitDailyReq ? u.limitDailyReq : unlimitedTxt;
                   
-                  let perT = u.limitTotalReq ? Math.min(100, (userReqs / u.limitTotalReq) * 100).toFixed(1) + '%' : '-';
-                  let perD = u.limitDailyReq ? Math.min(100, (userDReqs / u.limitDailyReq) * 100).toFixed(1) + '%' : '-';
+                  let perT = u.limitTotalReq ? Math.min(100, (userBytes / limitReqToBytes(u.limitTotalReq)) * 100).toFixed(1) + '%' : '-';
+                  let perD = u.limitDailyReq ? Math.min(100, (userDBytes / limitReqToBytes(u.limitDailyReq)) * 100).toFixed(1) + '%' : '-';
                   
-                  let expTxt = unlimitedTxt;
-                  let isExp = false;
-                  if (u.expiryMs) {
-                      let date = new Date(u.expiryMs);
-                      expTxt = lang === 'fa' ? date.toLocaleDateString('fa-IR') : date.toLocaleDateString();
-                      if (Date.now() > u.expiryMs) { 
-                          const expiredTxt = lang === 'fa' ? ' (منقضی شده)' : ' (Expired)';
-                          expTxt += \` <span class="text-xs text-red-500 font-bold">\${expiredTxt}</span>\`; 
-                          isExp = true; 
-                      }
-                  }
+                   let expDateTxt = unlimitedTxt;
+                   let expRemainTxt = '';
+                   let expRemainCls = 'text-slate-400';
+                   let isExp = false;
+                   if (u.expiryMs) {
+                       let date = new Date(u.expiryMs);
+                       expDateTxt = lang === 'fa' ? date.toLocaleDateString('fa-IR') : date.toLocaleDateString();
+                       if (Date.now() > u.expiryMs) { isExp = true; }
+                       let daysLeft = Math.ceil((u.expiryMs - Date.now()) / 86400000);
+                       if (daysLeft < 0) {
+                           expRemainTxt = lang === 'fa' ? 'منقضی شده' : 'Expired';
+                           expRemainCls = 'text-red-500 font-bold';
+                       } else {
+                           expRemainTxt = daysLeft + (lang === 'fa' ? ' روز باقی‌مانده' : daysLeft === 1 ? ' day left' : ' days left');
+                           if (daysLeft < 7) expRemainCls = 'text-amber-500 font-semibold';
+                       }
+                   }
                   
                   const totalLabel = lang === 'fa' ? 'کل:' : 'Total:';
                   const dailyLabel = lang === 'fa' ? 'روزانه:' : 'Daily:';
-                  const rLabel = lang === 'fa' ? 'درخواست' : 'r';
 
                   let linkTitle = lang === 'fa' ? 'کپی لینک ساب' : 'Copy Subscription Link';
                   let pauseTitle = u.isPaused ? (lang === 'fa' ? 'فعال‌سازی کاربر' : 'Resume User') : (lang === 'fa' ? 'توقف کاربر' : 'Pause User');
@@ -7744,13 +9456,13 @@ function getDashboardUI(hasDB) {
                   let resetTitle = lang === 'fa' ? 'بازنشانی مصرف ترافیک' : 'Reset Traffic Metrics';
                   let deleteTitle = lang === 'fa' ? 'حذف کاربر' : 'Delete User';
 
-                   let linkHtml = \`<button onclick="copyData('sync-\${u.id}')" class="native-press flex-1 flex items-center justify-center text-primary hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 py-2 rounded-lg" title="\${linkTitle}">🔗</button>\`;
+                   let linkHtml = \`<button onclick="copyData('sync-\${u.id}')" class="user-action" title="\${linkTitle}">COPY</button>\`;
                    
-                   let pauseBtnHtml = \`<button onclick="togglePauseUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center \${u.isPaused ? 'text-green-500 hover:text-green-700 bg-green-50 hover:bg-green-100 dark:bg-green-900/30 dark:hover:bg-green-800/50' : 'text-amber-500 hover:text-amber-700 bg-amber-50 hover:bg-amber-100 dark:bg-amber-900/30 dark:hover:bg-amber-800/50'} py-2 rounded-lg" title="\${pauseTitle}">\\s*\${u.isPaused ? '▶️' : '⏸️'}</button>\`;
+                   let pauseBtnHtml = \`<button onclick="togglePauseUser('\${u.id}')" class="user-action" title="\${pauseTitle}">\${u.isPaused ? 'RESUME' : 'PAUSE'}</button>\`;
 
-                   let editBtnHtml = \`<button onclick="editUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-indigo-500 hover:text-indigo-700 bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-900/30 dark:hover:bg-indigo-800/50 py-2 rounded-lg" title="\${editTitle}">✏️</button>\`;
+                   let editBtnHtml = \`<button onclick="editUser('\${u.id}')" class="user-action" title="\${editTitle}">EDIT</button>\`;
 
-                   let resetBtnHtml = \`<button onclick="resetUserTraffic('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-violet-500 hover:text-violet-700 bg-violet-50 hover:bg-violet-100 dark:bg-violet-900/30 dark:hover:bg-violet-800/50 py-2 rounded-lg" title="\${resetTitle}">🔄</button>\`;
+                   let resetBtnHtml = \`<button onclick="resetUserTraffic('\${u.id}')" class="user-action" title="\${resetTitle}">RESET</button>\`;
 
                   let isAutoDisabled = u.isPaused && u.disabledReason;
                   let disableInfoHtml = '';
@@ -7776,61 +9488,55 @@ function getDashboardUI(hasDB) {
                       rawSync += rawSync.includes('?') ? '&flag=a' : '?flag=a';
                   }
 
-                  tblHtml += \`<div class="native-press bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder p-4 hover:shadow-md transition-shadow">
-                      <div class="flex items-center justify-between mb-3">
-                          <div class="flex items-center gap-2 min-w-0 flex-1">
+                  let portsBadge = '';
+                  if (u.userPorts) {
+                      let portCount = u.userPorts.split(',').map(s => s.trim()).filter(Boolean).length;
+                      portsBadge = \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-300" title="\${u.userPorts}">\${portCount} ports</span>\`;
+                  }
+
+                  tblHtml += \`<div class="native-press bg-white dark:bg-darkcard rounded-2xl border border-slate-200 dark:border-darkborder p-3 md:p-4 hover:shadow-md transition-shadow">
+                      <div class="flex flex-col gap-3 md:grid md:grid-cols-[5.5rem_8rem_minmax(0,1fr)_6rem_16rem] md:items-center md:gap-3">
+                          <div class="flex items-center gap-2 min-w-0">
                               <span class="w-2 h-2 rounded-full shrink-0 \${u.isPaused ? (isAutoDisabled ? 'bg-red-500' : 'bg-amber-500') : (isExp ? 'bg-red-400' : 'bg-emerald-500')}"></span>
-                              <span class="font-bold text-sm text-slate-800 dark:text-slate-100 truncate">\${u.name}</span>
+                              <span class="font-bold text-sm text-slate-800 dark:text-slate-100 truncate min-w-0">\${u.name}</span>
                               \${u.proxyIpGeo ? \`<span class="text-[10px] px-1.5 py-0.5 rounded bg-violet-50 dark:bg-violet-900/30 text-violet-600 dark:text-violet-300 font-semibold shrink-0">\${u.proxyIpGeo.flag}</span>\` : ''}
                           </div>
-                          <input type="hidden" id="sync-\${u.id}" value="\${rawSync}">
-                      </div>
-                      <div class="flex items-center gap-1 mb-3">
-                          \${linkHtml}
-                          \${pauseBtnHtml}
-                          \${editBtnHtml}
-                          \${resetBtnHtml}
-                          <button onclick="deleteUser('\${u.id}')" class="native-press flex-1 flex items-center justify-center text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 py-2 rounded-lg transition-colors text-sm" title="\${deleteTitle}">🗑️</button>
-                      </div>
-                      <div class="flex flex-wrap gap-1 mb-3">
-                          \${u.isPaused && u.disabledReason ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-300">Auto-Disabled</span>\` : ''}
-                          \${u.userMode ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-300">\${u.userMode === 'alpha' ? 'VLESS' : u.userMode === 'beta' ? 'Trojan' : 'Both'}</span>\` : ''}
-                          \${u.userPorts ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-300">\${u.userPorts}</span>\` : ''}
-                           \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-300">\${u.maxConfigs} cfgs</span>\` : ''}
-                           \${u.connLimit ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-50 dark:bg-cyan-900/30 text-cyan-600 dark:text-cyan-300">\${u.connLimit} conn</span>\` : ''}
+                          <div class="flex items-center gap-1 flex-wrap">
+                              \${u.isPaused && u.disabledReason ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-300">Auto-Disabled</span>\` : ''}
+                              \${u.userMode ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-300">\${u.userMode === 'alpha' ? 'VLESS' : u.userMode === 'beta' ? 'Trojan' : 'Both'}</span>\` : ''}
+                              \${portsBadge}
+                              \${u.maxConfigs ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-300">\${u.maxConfigs} cfgs</span>\` : ''}
+                              \${u.connLimit ? \`<span class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-50 dark:bg-cyan-900/30 text-cyan-600 dark:text-cyan-300">\${u.connLimit} conn</span>\` : ''}
+                          </div>
+                          <div class="min-w-0">
+                              <div class="flex items-center justify-between gap-2 text-[10px] leading-4 mb-1">
+                                  <span class="flex items-center gap-1.5">
+                                      <span class="font-bold text-slate-400 uppercase tracking-wider shrink-0">\${totalLabel}</span>
+                                      <span class="font-mono text-slate-500 dark:text-slate-400 whitespace-nowrap">\${u.limitTotalReq ? \`\${(userBytes/1073741824).toFixed(2)} / \${(u.limitTotalReq/6000).toFixed(2)} GB\` : \`\${(userBytes/1073741824).toFixed(2)} GB / ∞\`}</span>
+                                  </span>
+                                  <span class="font-mono text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">\${u.limitTotalReq ? \`\${(Math.max(0, limitReqToBytes(u.limitTotalReq) - userBytes)/1073741824).toFixed(2)} GB \${lang === 'fa' ? 'باقی‌مانده' : 'left'}\` : ''}</span>
+                              </div>
+                              \${u.limitTotalReq ? \`<div class="w-full bg-slate-200 dark:bg-slate-700 h-1.5 rounded-full overflow-hidden"><div class="bg-gradient-to-r \${parseFloat(perT) > 90 ? 'from-red-500 to-rose-600' : parseFloat(perT) > 70 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perT}"></div></div>\` : ''}
+                              <div class="flex items-center justify-between gap-2 text-[9px] leading-4 mt-2 mb-0.5">
+                                  <span class="font-bold text-slate-400 uppercase tracking-wider shrink-0">\${dailyLabel}</span>
+                                  <span class="font-mono text-slate-500 dark:text-slate-400 whitespace-nowrap">\${u.limitDailyReq ? \`\${(userDBytes/1073741824).toFixed(2)} / \${(u.limitDailyReq/6000).toFixed(2)} GB\` : \`\${(userDBytes/1073741824).toFixed(2)} GB / ∞\`}</span>
+                              </div>
+                              \${u.limitDailyReq ? \`<div class="w-full bg-slate-200 dark:bg-slate-700 h-1 rounded-full overflow-hidden"><div class="bg-gradient-to-r \${parseFloat(perD) > 90 ? 'from-red-500 to-rose-600' : parseFloat(perD) > 70 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perD}"></div></div>\` : ''}
+                          </div>
+                          <div class="text-[10px] text-slate-400">
+                              <div class="whitespace-nowrap">📅 \${u.expiryMs ? expDateTxt : '∞'}</div>
+                              \${u.expiryMs ? \`<div class="\${expRemainCls}">\${expRemainTxt}</div>\` : ''}
+                          </div>
+                          <div class="user-actions justify-end flex-nowrap">
+                              \${linkHtml}
+                              \${pauseBtnHtml}
+                              \${editBtnHtml}
+                              \${resetBtnHtml}
+                              <button onclick="deleteUser('\${u.id}')" class="user-action danger" title="\${deleteTitle}">DEL</button>
+                          </div>
                       </div>
                       \${disableInfoHtml}
-                      <div class="grid grid-cols-2 gap-3">
-                          <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-2.5">
-                              <div class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">\${totalLabel}</div>
-                              <div class="text-sm font-black text-slate-800 dark:text-white">\${(userReqs/6000).toFixed(2)} <span class="text-[10px] font-semibold text-slate-400">GB</span></div>
-                              \${u.limitTotalReq ? \`
-                              <div class="w-full bg-slate-200 dark:bg-slate-700 h-1.5 rounded-full overflow-hidden mt-1.5">
-                                  <div class="bg-gradient-to-r \${parseFloat(perT) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perT) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perT}"></div>
-                              </div>
-                              <div class="flex items-center justify-between mt-1">
-                                  <span class="text-[9px] text-slate-400">/ \${(u.limitTotalReq/6000).toFixed(2)} GB</span>
-                                  \${perT !== '-' ? \`<span class="text-[9px] font-bold \${parseFloat(perT) > 85 ? 'text-red-500' : parseFloat(perT) > 60 ? 'text-amber-500' : 'text-emerald-500'}">\${perT}</span>\` : ''}
-                              </div>
-                              \` : '<div class="text-[9px] text-slate-400 mt-1">' + unlimitedTxt + '</div>'}
-                          </div>
-                          <div class="bg-slate-50 dark:bg-slate-800/50 rounded-xl p-2.5">
-                              <div class="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1">\${dailyLabel}</div>
-                              <div class="text-sm font-black text-slate-800 dark:text-white">\${userDReqs} <span class="text-[10px] font-semibold text-slate-400">\${rLabel}</span></div>
-                              \${u.limitDailyReq ? \`
-                              <div class="w-full bg-slate-200 dark:bg-slate-700 h-1.5 rounded-full overflow-hidden mt-1.5">
-                                  <div class="bg-gradient-to-r \${parseFloat(perD) > 85 ? 'from-red-500 to-rose-600' : parseFloat(perD) > 60 ? 'from-amber-500 to-orange-500' : 'from-emerald-500 to-teal-500'} h-full rounded-full" style="width: \${perD}"></div>
-                              </div>
-                              <div class="flex items-center justify-between mt-1">
-                                  <span class="text-[9px] text-slate-400">/ \${(u.limitDailyReq/6000).toFixed(2)} GB</span>
-                                  \${perD !== '-' ? \`<span class="text-[9px] font-bold \${parseFloat(perD) > 85 ? 'text-red-500' : parseFloat(perD) > 60 ? 'text-amber-500' : 'text-emerald-500'}">\${perD}</span>\` : ''}
-                              </div>
-                              \` : '<div class="text-[9px] text-slate-400 mt-1">' + unlimitedTxt + '</div>'}
-                          </div>
-                      </div>
-                      <div class="flex items-center justify-between mt-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-                          <span class="text-[10px] text-slate-400">📅 \${expTxt}</span>
-                      </div>
+                      <input type="hidden" id="sync-\${u.id}" value="\${rawSync}">
                   \`;
                   tblHtml += '</div>';
               });
@@ -8145,6 +9851,12 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               setTimeout(() => { renderProfiles(); }, 2500);
           }
 
+          function toggleSegMode() {
+              const mode = document.getElementById('edit-user-seg-mode').value;
+              document.getElementById('edit-user-seg-builder-wrap').classList.toggle('hidden', mode !== 'builder');
+              document.getElementById('edit-user-seg-manual-wrap').classList.toggle('hidden', mode !== 'manual');
+          }
+
           function editUser(uuid) {
               if(!window.nahanConfig || !window.nahanConfig.users) return;
               let u = window.nahanConfig.users.find(usr => usr.id === uuid);
@@ -8198,6 +9910,16 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               document.getElementById('edit-user-max-configs').value = u.maxConfigs || '';
               document.getElementById('edit-user-conn-limit').value = u.connLimit || '';
               document.getElementById('edit-user-panel-url').value = u.userPanelUrl || '';
+
+              document.getElementById('edit-user-seg-mode').value = u.segMode || 'off';
+              document.getElementById('edit-user-seg-packets').value = u.segPackets || '';
+              document.getElementById('edit-user-seg-lengths').value = u.segLengths || '';
+              document.getElementById('edit-user-seg-delays').value = u.segDelays || '';
+              document.getElementById('edit-user-seg-max-split').value = u.segMaxSplit || '';
+              document.getElementById('edit-user-seg-manual').value = u.segManual || '';
+              document.getElementById('edit-user-tls-mask').value = u.tlsMask || '';
+              if (u.segMode === 'builder') document.getElementById('edit-user-seg-builder-wrap').classList.remove('hidden');
+              if (u.segMode === 'manual') document.getElementById('edit-user-seg-manual-wrap').classList.remove('hidden');
               
               buildPortCheckboxes('edit-user-ports-wrap', u.userPorts);
               buildModeCheckboxes('edit-user-mode-wrap', u.userMode);
@@ -8258,6 +9980,13 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                 let connLimit = document.getElementById('edit-user-conn-limit').value;
                 connLimit = connLimit ? parseInt(connLimit) : null;
                 const userPanelUrl = document.getElementById('edit-user-panel-url').value.trim() || null;
+                const segMode = document.getElementById('edit-user-seg-mode').value;
+                const segPackets = document.getElementById('edit-user-seg-packets').value.trim() || null;
+                const segLengths = document.getElementById('edit-user-seg-lengths').value.trim() || null;
+                const segDelays = document.getElementById('edit-user-seg-delays').value.trim() || null;
+                const segMaxSplit = document.getElementById('edit-user-seg-max-split').value.trim() || null;
+                const segManual = document.getElementById('edit-user-seg-manual').value.trim() || null;
+                const tlsMask = document.getElementById('edit-user-tls-mask').value.trim() || null;
                
                if(!name) {
                   alert(lang === 'fa' ? 'لطفاً نام را وارد کنید' : 'Please enter a name');
@@ -8291,6 +10020,13 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
               u.nat64 = nat64;
               u.connLimit = connLimit;
               u.userPanelUrl = userPanelUrl;
+              u.segMode = segMode;
+              u.segPackets = segPackets;
+              u.segLengths = segLengths;
+              u.segDelays = segDelays;
+              u.segMaxSplit = segMaxSplit;
+              u.segManual = segManual;
+              u.tlsMask = tlsMask;
               
               document.getElementById('view-edit-user').classList.add('hidden');
               document.getElementById('view-users').classList.remove('hidden');
@@ -8503,7 +10239,7 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                           showUpdateBanner((document.getElementById('cfg-github-repo')?.value || window.nahanConfig?.githubRepo || 'Ceetherr/swimshady').replace('https://github.com/', '').replace('http://github.com/', '').trim(), data.latest);
                       }
                   }
-                  if (data.success && !data.canDeploy) {
+                  if (data.success && data.updateAvailable && !data.canDeploy) {
                       const statusEl = document.getElementById('update-deploy-status');
                       if (statusEl) {
                           statusEl.classList.remove('hidden');
@@ -8738,6 +10474,10 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
           async function showUpdateBanner(repo, version) {
               const banner = document.getElementById('update-alert-banner');
               if (!banner) return;
+              try {
+                  const dismissed = JSON.parse(localStorage.getItem('swimshady_dismissed_updates') || '[]');
+                  if (dismissed.includes(version)) return;
+              } catch(e) {}
               
               const msg = lang === 'fa' 
                   ? 'نسخه جدیدتر (v' + version + ') در مخزن گیت\u200cهاب شما (' + repo + ') در دسترس است.' 
@@ -8887,6 +10627,13 @@ function buildPortCheckboxes(wrapId, selectedPorts) {
                   b.classList.add('hidden');
                   b.style.display = 'none';
               }
+              try {
+                  const dismissed = JSON.parse(localStorage.getItem('swimshady_dismissed_updates') || '[]');
+                  if (!dismissed.includes(CURRENT_VERSION)) {
+                      dismissed.push(CURRENT_VERSION);
+                      localStorage.setItem('swimshady_dismissed_updates', JSON.stringify(dismissed));
+                  }
+              } catch(e) {}
           }
 
           document.addEventListener('DOMContentLoaded', () => {
