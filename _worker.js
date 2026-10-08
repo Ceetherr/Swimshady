@@ -8420,6 +8420,34 @@ function getDashboardUI(hasDB) {
           };
 
           const CHANGELOG_DATA = {
+              "1.3.0": {
+                  headline: { en: "TLS Fragmentation, Relay Self-Healing & Telegram Bot Upgrades" },
+                  added: [
+                      { en: "TLS fragmentation (segmentation) — split ClientHello into multiple packets to evade SNI-based filtering" },
+                      { en: "TLS cipher mask — control which ciphers the ClientHello advertises" },
+                      { en: "Relay self-healing — dead relays are quarantined, probed, and automatically buried/resurrected" },
+                      { en: "Telegram: copy sub link button on user detail" },
+                      { en: "Telegram: full user creation with ports, mode, proxy, clean IPs, and device limit" },
+                      { en: "Telegram: relay status menu showing healthy and quarantined relays" },
+                      { en: "Telegram: bulk operations — reset all traffic, extend all expiry, bulk delete with selection" },
+                      { en: "Telegram: notification preferences — toggle 10 alert types individually" },
+                      { en: "Telegram: per-user config links for Clash, sing-box, v2rayN, and Raw" }
+                  ],
+                  fixed: [
+                      { en: "maxConfigs producing wrong line count — now generates exactly the requested number of configs" },
+                      { en: "Proxies not all appearing in configs — per-user and global proxy lists are now combined" },
+                      { en: "Reset not reflected in sub link or app — usage epoch invalidation fixes stale data across isolates" },
+                      { en: "Live profile usage showing zero — uuidUsage now merges across isolates via D1" },
+                      { en: "Update notification gaps — idle re-check, dismiss persistence, pre-release version handling" }
+                  ],
+                  improved: [
+                      { en: "User rows now use a fixed grid layout — usage bars are perfectly aligned across all rows" },
+                      { en: "Ports shown as a count badge with full list in hover tooltip" },
+                      { en: "Expiry shows remaining days with color coding (yellow under 7 days, red when expired)" },
+                      { en: "Usage text no longer truncated — used/total on left, remaining on right" }
+                  ],
+                  notes: []
+              },
               "1.2.1": {
                   headline: { en: "Custom Config Name Fix & Update Notification Fix" },
                   added: [],
