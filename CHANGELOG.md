@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.3.0
+
+### Added
+- TLS fragmentation (segmentation) — split ClientHello into multiple packets to evade SNI-based filtering
+- TLS cipher mask — control which ciphers the ClientHello advertises
+- Relay self-healing — dead relays are quarantined, probed, and automatically buried/resurrected
+- Telegram: copy sub link button on user detail
+- Telegram: full user creation with ports, mode, proxy, clean IPs, and device limit
+- Telegram: relay status menu showing healthy and quarantined relays
+- Telegram: bulk operations — reset all traffic, extend all expiry, bulk delete with selection
+- Telegram: notification preferences — toggle 10 alert types individually
+- Telegram: per-user config links for Clash, sing-box, v2rayN, and Raw
+
+### Fixed
+- maxConfigs producing wrong line count — now generates exactly the requested number of configs
+- Proxies not all appearing in configs — per-user and global proxy lists are now combined
+- Reset not reflected in sub link or app — usage epoch invalidation fixes stale data across isolates
+- Live profile usage showing zero — uuidUsage now merges across isolates via D1
+- Update notification gaps — idle re-check, dismiss persistence, pre-release version handling
+
+### Improved
+- User rows now use a fixed grid layout — usage bars are perfectly aligned across all rows
+- Ports shown as a count badge with full list in hover tooltip
+- Expiry shows remaining days with color coding (yellow under 7 days, red when expired)
+- Usage text no longer truncated — used/total on left, remaining on right
+
 ## v1.2.1
 
 ### Fixed
